@@ -26,7 +26,17 @@ npm install
 npm run dev
 ```
 
-本地环境变量参考 `.env.example`。当前原型可能仍使用 `GEMINI_API_KEY`，后续需要按计划迁移到 Supabase Edge Function 的 `parse-receipt`。
+本地环境变量参考 `.env.example`。OCR/AI 解析统一走 Supabase Edge Function 的 `parse-receipt`。
+
+## 验证命令
+
+```bash
+npm test
+npm run lint
+npm run build
+```
+
+`npm run build` 输出 `dist/`，可部署到 Vercel、Netlify、Cloudflare Pages、Supabase Hosting 或任意静态站点服务。
 
 ## 目录说明
 
@@ -61,6 +71,8 @@ OPENAI_API_KEY
 GOOGLE_VISION_KEY
 SUPABASE_SERVICE_ROLE_KEY
 ```
+
+不要在 Vite、`.env.example`、React 源码或任何静态部署环境变量中配置上述三个私密 key。
 
 详细部署与密钥说明见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 

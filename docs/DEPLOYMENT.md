@@ -42,7 +42,7 @@ SUPABASE_SERVICE_ROLE_KEY
 设置示例：
 
 ```bash
-supabase secrets set OPENAI_API_KEY=sk-xxx
+supabase secrets set OPENAI_API_KEY=<openai-api-key>
 supabase secrets set GOOGLE_VISION_KEY=xxx
 supabase secrets set SUPABASE_SERVICE_ROLE_KEY=xxx
 ```
@@ -106,4 +106,49 @@ Edge Function: parse-receipt
 ```
 
 前端上传文件时必须使用该路径格式。Edge Function 使用 service role 读取原始文件并写回解析结果。
+
+## 9. 前端部署步骤
+
+静态前端部署时只配置：
+
+```text
+VITE_SUPABASE_URL
+VITE_SUPABASE_ANON_KEY
+```
+
+构建命令：
+
+```bash
+npm install
+npm run build
+```
+
+输出目录：
+
+```text
+dist
+```
+
+Supabase Function secrets 单独设置，不要复制到前端托管平台：
+
+```bash
+supabase secrets set OPENAI_API_KEY=...
+supabase secrets set GOOGLE_VISION_KEY=...
+supabase secrets set SUPABASE_SERVICE_ROLE_KEY=...
+supabase functions deploy parse-receipt
+```
+
+## 10. 上线前检查
+
+- `npm test` 通过。
+- `npm run lint` 通过。
+- `npm run build` 通过。
+- 前端源码、Vite 配置、`.env.example` 不包含 OpenAI、Google Vision、service role 或 Gemini key。
+- `receipts` 和 `receipt_items` 已启用 RLS。
+- `receipts` Storage bucket 为 private。
+- Storage object path 使用 `{user_id}/{receipt_id}/original.ext`。
+- `parse-receipt` 已部署，并能通过当前用户 JWT 校验 receipt 所有权。
+- 上传一张清晰收据后，状态能从 `uploaded` 进入 `processing`，最后到 `pending_review` 或 `failed`。
+- 审核保存能写回 `receipts` 与 `receipt_items`。
+- Excel 导出能下载 `.xlsx`。
 

@@ -12,9 +12,9 @@ interface ExportToolbarProps {
 export function ExportToolbar({ receipts, selectedReceipts = [], label = '导出 Excel', onExported }: ExportToolbarProps) {
   const exportRows = selectedReceipts.length > 0 ? selectedReceipts : receipts
 
-  const handleExport = () => {
+  const handleExport = async () => {
     if (exportRows.length === 0) return
-    downloadReceiptsXlsx(exportRows)
+    await downloadReceiptsXlsx(exportRows)
     onExported?.(exportRows.length)
   }
 

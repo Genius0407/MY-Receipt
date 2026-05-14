@@ -648,7 +648,7 @@ export default function App() {
       + (parseFloat(selectedReceipt.rounding) || 0);
   }, [selectedReceipt, itemsTotal]);
 
-  const handleExport = (singleItem: any = null) => {
+  const handleExport = async (singleItem: any = null) => {
     let dataToExport = [];
     if (singleItem) {
        dataToExport = [singleItem]; 
@@ -663,7 +663,7 @@ export default function App() {
        return;
     }
 
-    downloadReceiptsXlsx(dataToExport.map(toApiReceipt));
+    await downloadReceiptsXlsx(dataToExport.map(toApiReceipt));
 
     showToast(`Successfully Exported ${dataToExport.length} Records!`, 'success');
     setSelectedRowIds([]);

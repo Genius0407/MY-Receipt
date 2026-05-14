@@ -1,4 +1,3 @@
-import * as XLSX from 'xlsx'
 import type { Receipt } from '../types/receipt'
 
 export interface ReceiptExportRow {
@@ -41,12 +40,43 @@ export function flattenReceipts(receipts: Receipt[]): ReceiptExportRow[] {
   })
 }
 
-export function downloadReceiptsXlsx(receipts: Receipt[], filename = buildExportFilename()) {
+export async function downloadReceiptsXlsx(receipts: Receipt[], filename = buildExportFilename()) {
   const rows = flattenReceipts(receipts)
-  const worksheet = XLSX.utils.json_to_sheet(rows)
-  const workbook = XLSX.utils.book_new()
-  XLSX.utils.book_append_sheet(workbook, worksheet, 'Receipts')
-  XLSX.writeFile(workbook, filename)
+  const ExcelJS = await import('exceljs')
+  const workbook = new ExcelJS.Workbook()
+  const worksheet = workbook.addWorksheet('Receipts')
+
+  worksheet.columns = [
+    { header: 'Receipt ID', key: 'receipt_id', width: 38 },
+    { header: 'Merchant', key: 'merchant_name', width: 28 },
+    { header: 'Invoice No', key: 'invoice_no', width: 20 },
+    { header: 'Date', key: 'date', width: 14 },
+    { header: 'Category', key: 'category', width: 14 },
+    { header: 'Doc Type', key: 'doc_type', width: 14 },
+    { header: 'Status', key: 'status', width: 16 },
+    { header: 'Tags', key: 'tags', width: 28 },
+    { header: 'Grand Total', key: 'grand_total', width: 14 },
+    { header: 'Item Name', key: 'item_name', width: 32 },
+    { header: 'Qty', key: 'item_qty', width: 10 },
+    { header: 'Unit Price', key: 'item_unit_price', width: 14 },
+    { header: 'Line Total', key: 'item_line_total', width: 14 },
+  ]
+
+  rows.forEach((row) => worksheet.addRow(row))
+  worksheet.getRow(1).font = { bold: true }
+
+  const buffer = await workbook.xlsx.writeBuffer()
+  const blob = new Blob([buffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
 }
 
 function buildExportFilename() {
