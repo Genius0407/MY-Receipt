@@ -1,4 +1,13 @@
-# 马来西亚英文收据智能识别系统
+# MY-Receipt
+
+马来西亚英文收据智能识别与管理系统。
+
+当前仓库包含两部分：
+
+- 远程仓库已有的 React/Vite 前端原型。
+- 新增的 Supabase 架构文档、数据库 schema、Edge Function 开发计划。
+
+## 架构目标
 
 公网部署版本采用：
 
@@ -6,42 +15,35 @@
 静态前端 + Supabase Auth/Storage/Postgres + Supabase Edge Function + Google Vision + OpenAI
 ```
 
-前端仍是纯静态应用，不需要自建服务器。OCR 和 AI 需要保护密钥，因此放在 Supabase Edge Function 中执行。
+前端仍是纯静态应用，不需要自建服务器。OCR 和 AI 需要保护密钥，因此最终生产路径放在 Supabase Edge Function 中执行。
 
-## 当前目录
+## 本地运行
+
+前端原型来自 AI Studio，当前可按远程项目方式运行：
+
+```bash
+npm install
+npm run dev
+```
+
+本地环境变量参考 `.env.example`。当前原型可能仍使用 `GEMINI_API_KEY`，后续需要按计划迁移到 Supabase Edge Function 的 `parse-receipt`。
+
+## 目录说明
 
 ```text
-malaixiya/
-├── index (2).html                     # Google AI Studio 生成的 React/Tailwind UI 参考稿
+MY-Receipt/
+├── src/                              # 当前 React/Vite 前端原型
+├── public/
 ├── docs/
-│   ├── ARCHITECTURE.md                # 新架构说明
-│   ├── DEPLOYMENT.md                  # 部署与密钥管理
-│   └── SUPABASE_SCHEMA.sql            # Supabase 表结构与 RLS
-├── supabase/
-│   └── functions/
-│       └── README.md                  # Edge Function 开发说明
-├── .env.example                       # 环境变量模板
-└── .gitignore
+│   ├── ARCHITECTURE.md               # Supabase 目标架构
+│   ├── DEPLOYMENT.md                 # 部署与密钥管理
+│   ├── SUPABASE_SCHEMA.sql           # Supabase 表结构与 RLS
+│   └── superpowers/plans/            # 详细开发计划
+├── supabase/functions/README.md      # Edge Function 开发说明
+├── index (2).html                    # Google AI Studio 生成的 UI 参考稿
+├── package.json
+└── .env.example
 ```
-
-旧 V1.0 静态入口和 Cloudflare Worker 代码已删除，避免后续继续沿用过时架构。
-
-## 架构说明
-
-核心流程：
-
-```text
-用户上传收据
-  -> 前端上传文件到 Supabase Storage
-  -> 前端创建 receipts 记录
-  -> 前端调用 Supabase Edge Function parse-receipt
-  -> Edge Function 调 Google Vision OCR
-  -> Edge Function 调 OpenAI 抽取结构化 JSON
-  -> Edge Function 写入 Supabase Postgres
-  -> 前端展示、校对、标签、筛选、导出 Excel
-```
-
-详细说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 密钥放置
 
@@ -73,13 +75,15 @@ Supabase 需要：
 
 SQL 参考：[docs/SUPABASE_SCHEMA.sql](docs/SUPABASE_SCHEMA.sql)。
 
-## 后续开发路线
+## 开发计划
 
-详细执行计划见 [docs/superpowers/plans/2026-05-14-supabase-receipt-platform.md](docs/superpowers/plans/2026-05-14-supabase-receipt-platform.md)。
+详细执行计划见：
+
+[docs/superpowers/plans/2026-05-14-supabase-receipt-platform.md](docs/superpowers/plans/2026-05-14-supabase-receipt-platform.md)
 
 主线：
 
-1. 将 `index (2).html` 的 UI 迁移为正式 React + Vite + Tailwind 工程。
+1. 梳理并保留当前 React/Vite UI 中可复用的页面和组件。
 2. 接入 Supabase Auth。
 3. 接入 Supabase Storage 上传。
 4. 创建 Supabase 表和 RLS。
