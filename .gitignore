@@ -3,6 +3,7 @@ build/
 dist/
 coverage/
 .obsidian/
+.worktrees/
 .DS_Store
 Thumbs.db
 *.log
@@ -11,4 +12,3 @@ Thumbs.db
 !.env.example
 .dev.vars
 .dev.vars.*
-
