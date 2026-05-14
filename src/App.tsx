@@ -14,6 +14,7 @@ import {
   listReceipts,
   saveReceipt,
 } from './lib/receiptApi';
+import { downloadReceiptsXlsx } from './lib/exportExcel';
 
 // 初始模拟数据：完全覆盖 PRD V1.1 的所有字段与要求状态
 const INITIAL_HISTORY = [
@@ -166,6 +167,7 @@ function toApiReceipt(receipt: any) {
     category: receipt.category || receipt.industry || 'Other',
     tax: receipt.tax ?? receipt.tax_sst ?? 0,
     subsidy_details: receipt.subsidy_details || (receipt.subsidy_info ? { description: receipt.subsidy_info } : null),
+    receipt_items: receipt.receipt_items || receipt.items || [],
   };
 }
 
@@ -647,9 +649,6 @@ export default function App() {
   }, [selectedReceipt, itemsTotal]);
 
   const handleExport = (singleItem: any = null) => {
-    const dateStr = new Date().toISOString().replace(/[:\-T]/g, '').slice(0, 14);
-    const fileName = `Receipts_Export_${dateStr}.csv`;
-    
     let dataToExport = [];
     if (singleItem) {
        dataToExport = [singleItem]; 
@@ -663,30 +662,8 @@ export default function App() {
        showToast(t.noPending, 'info');
        return;
     }
-    
-    const headers = ['ID', 'Merchant', 'Invoice No', 'Date', `Total ${config.currency}`, 'Status', 'Doc Type', 'Industry', 'Tags'];
-    const rows = dataToExport.map(item => 
-      [
-        item.id, 
-        `"${item.merchant_name || ''}"`, 
-        `"${item.invoice_no || ''}"`, 
-        item.date, 
-        item.grand_total, 
-        item.status, 
-        item.doc_type, 
-        item.industry,
-        `"${(item.tags || []).join(', ')}"`
-      ].join(',')
-    );
-    const csvContent = "data:text/csv;charset=utf-8,\uFEFF" + [headers.join(','), ...rows].join('\n');
 
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
-    link.setAttribute("download", fileName);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    downloadReceiptsXlsx(dataToExport.map(toApiReceipt));
 
     showToast(`Successfully Exported ${dataToExport.length} Records!`, 'success');
     setSelectedRowIds([]);
