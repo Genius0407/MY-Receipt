@@ -75,6 +75,10 @@ SQL 参考：[docs/SUPABASE_SCHEMA.sql](docs/SUPABASE_SCHEMA.sql)。
 
 ## 后续开发路线
 
+详细执行计划见 [docs/superpowers/plans/2026-05-14-supabase-receipt-platform.md](docs/superpowers/plans/2026-05-14-supabase-receipt-platform.md)。
+
+主线：
+
 1. 将 `index (2).html` 的 UI 迁移为正式 React + Vite + Tailwind 工程。
 2. 接入 Supabase Auth。
 3. 接入 Supabase Storage 上传。
