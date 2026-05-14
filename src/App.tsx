@@ -7,7 +7,13 @@ import {
   Tag, AlertTriangle, FileSpreadsheet, Cpu, RefreshCcw, FileOutput, ZoomIn, Cloud,
   Languages, Sun, Moon, Banknote
 } from 'lucide-react';
-import { supabase } from './lib/supabase';
+import {
+  createReceiptFileSignedUrl,
+  createReceiptFromFile,
+  deleteReceipt,
+  listReceipts,
+  saveReceipt,
+} from './lib/receiptApi';
 
 // 初始模拟数据：完全覆盖 PRD V1.1 的所有字段与要求状态
 const INITIAL_HISTORY = [
@@ -121,6 +127,47 @@ const THEMES = [
 ];
 const LANGUAGES = ['中文', 'English', 'Melayu'];
 const CURRENCIES = ['RM', 'SGD', 'USD', '¥'];
+
+const DISPLAY_STATUS_BY_DB_STATUS: Record<string, string> = {
+  uploaded: 'Pending',
+  processing: 'Pending',
+  pending_review: 'Pending',
+  synced: 'Synced',
+  failed: 'Failed',
+};
+
+const DB_STATUS_BY_DISPLAY_STATUS: Record<string, string> = {
+  Pending: 'pending_review',
+  Synced: 'synced',
+  Failed: 'failed',
+};
+
+function toDisplayReceipt(receipt: any) {
+  const items = receipt.receipt_items || receipt.items || [];
+  const category = receipt.category || receipt.industry || 'Other';
+  const tax = receipt.tax ?? receipt.tax_sst ?? 0;
+
+  return {
+    ...receipt,
+    status: DISPLAY_STATUS_BY_DB_STATUS[receipt.status] || receipt.status || 'Pending',
+    category,
+    industry: category,
+    tax,
+    tax_sst: tax,
+    subsidy_info: receipt.subsidy_info || receipt.subsidy_details?.description || '',
+    items,
+  };
+}
+
+function toApiReceipt(receipt: any) {
+  return {
+    ...receipt,
+    status: DB_STATUS_BY_DISPLAY_STATUS[receipt.status] || receipt.status || 'pending_review',
+    category: receipt.category || receipt.industry || 'Other',
+    tax: receipt.tax ?? receipt.tax_sst ?? 0,
+    subsidy_details: receipt.subsidy_details || (receipt.subsidy_info ? { description: receipt.subsidy_info } : null),
+  };
+}
 
 // 深度扩充的 I18N 全局多语言词典
 const I18N: any = {
@@ -470,26 +517,14 @@ export default function App() {
   }, [config.language]);
 
   const syncToDatabase = async (data: any) => {
-    if (!supabase) return;
     try {
-      const { error } = await supabase
-        .from('receipts')
-        .upsert({
-          id: data.id,
-          merchant_name: data.merchant_name,
-          grand_total: data.grand_total,
-          date: data.date,
-          status: data.status,
-          invoice_no: data.invoice_no,
-          image_url: data.image_url,
-          tags: data.tags,
-          doc_type: data.doc_type,
-          industry: data.industry,
-          items: data.items,
-          confidence_score: data.confidence_score,
-          raw_data: data
-        });
-      if (error) throw error;
+      const saved = await saveReceipt(toApiReceipt(data), data.items || []);
+      const displayReceipt = toDisplayReceipt({
+        ...saved,
+        image_url: data.image_url,
+      });
+      setHistory((current) => current.map((item) => item.id === displayReceipt.id ? displayReceipt : item));
+      setSelectedReceipt((current: any) => current?.id === displayReceipt.id ? displayReceipt : current);
       showToast("Synced to Supabase Successfully!", "success");
     } catch (err) {
       console.error("Supabase sync error:", err);
@@ -499,16 +534,16 @@ export default function App() {
 
   useEffect(() => {
     const loadData = async () => {
-      if (!supabase) return;
-      const { data, error } = await supabase
-        .from('receipts')
-        .select('*')
-        .order('created_at', { ascending: false });
-      
-      if (error) {
+      try {
+        const data = await listReceipts();
+        const displayData = await Promise.all(data.map(async (receipt) => {
+          const signedUrl = await createReceiptFileSignedUrl(receipt.file_path);
+          return toDisplayReceipt({ ...receipt, image_url: signedUrl });
+        }));
+        setHistory(displayData);
+      } catch (error) {
         console.error('Error loading receipts:', error);
-      } else if (data && data.length > 0) {
-        setHistory(data);
+        showToast('Failed to load Supabase receipts.', 'error');
       }
     };
     loadData();
@@ -671,56 +706,29 @@ export default function App() {
     setUploadList(prev => [...newItems, ...prev]);
 
     for (const item of newItems) {
-      setUploadList((old: any[]) => old.map(u => u.id === item.id ? { ...u, status: 'Processing (OCR)', progress: 20 } : u));
-      
-      let imageUrl = item.image_url;
+      setUploadList((old: any[]) => old.map(u => u.id === item.id ? { ...u, status: 'Uploading to Supabase', progress: 25 } : u));
 
-      // Upload to Supabase Storage if available
-      if (supabase && item.file) {
-        try {
-          const fileExt = item.file.name.split('.').pop();
-          const fileName = `${Math.random().toString(36).substring(2)}.${fileExt}`;
-          const filePath = `${fileName}`;
+      try {
+        const result = await createReceiptFromFile(item.file);
+        setUploadList((old: any[]) => old.map(u => u.id === item.id ? { ...u, progress: 90, status: 'Waiting for AI result' } : u));
+        const signedUrl = await createReceiptFileSignedUrl(result.receipt.file_path);
+        const displayReceipt = toDisplayReceipt({
+          ...result.receipt,
+          image_url: signedUrl || item.image_url,
+        });
 
-          const { error: uploadError } = await supabase.storage
-            .from('receipts')
-            .upload(filePath, item.file);
-
-          if (uploadError) throw uploadError;
-
-          const { data: { publicUrl } } = supabase.storage
-            .from('receipts')
-            .getPublicUrl(filePath);
-          
-          imageUrl = publicUrl;
-        } catch (err) {
-          console.error('Supabase upload failed:', err);
+        setHistory((prev_history: any[]) => [displayReceipt, ...prev_history.filter((receipt) => receipt.id !== displayReceipt.id)]);
+        if (result.parseError) {
+          showToast(result.parseError, 'error');
+        } else {
+          showToast(`${item.name} uploaded.`, 'success');
         }
-      }
-
-      setUploadList((old: any[]) => old.map(u => u.id === item.id ? { ...u, progress: 60, status: 'Processing (AI Parsing)' } : u));
-      
-      setTimeout(async () => {
-        const mockResult = {
-          id: item.id,
-          status: 'Pending',
-          merchant_name: item.name.split('.')[0],
-          date: new Date().toISOString().split('T')[0],
-          grand_total: (Math.random() * 200).toFixed(2),
-          image_url: imageUrl,
-          items: [
-            { id: 'm1', name: '识别商品 A', qty: 1, unit_price: 10, line_total: 10 }
-          ],
-          doc_type: 'Receipt',
-          industry: 'Other',
-          tags: ['Pending'],
-          confidence_score: 0.85 + Math.random() * 0.1
-        };
-        
-        await syncToDatabase(mockResult);
-        setHistory((prev_history: any[]) => [mockResult, ...prev_history]);
         setUploadList((old: any[]) => old.filter(u => u.id !== item.id));
-      }, 1000);
+      } catch (error) {
+        console.error('Receipt upload failed:', error);
+        setUploadList((old: any[]) => old.map(u => u.id === item.id ? { ...u, status: 'Failed', progress: 100 } : u));
+        showToast(error instanceof Error ? error.message : 'Upload failed.', 'error');
+      }
     }
   };
 
@@ -733,17 +741,14 @@ export default function App() {
     if (e) e.stopPropagation();
     if (!window.confirm('确定要删除这条记录吗？')) return;
 
-    if (supabase) {
-      try {
-        const { error } = await supabase
-          .from('receipts')
-          .delete()
-          .eq('id', id);
-        if (error) throw error;
-      } catch (err) {
-        console.error('Failed to delete from Supabase:', err);
-      }
+    try {
+      await deleteReceipt(id);
+    } catch (err) {
+      console.error('Failed to delete from Supabase:', err);
+      showToast('Delete failed.', 'error');
+      return;
     }
+
     setHistory(prev => prev.filter(h => h.id !== id));
     if (selectedReceipt?.id === id) setSelectedReceipt(null);
   };
