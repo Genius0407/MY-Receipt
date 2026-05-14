@@ -85,3 +85,25 @@ await supabase.functions.invoke('parse-receipt', {
 
 优先使用 SDK 调用 Edge Function。若直接使用 `fetch`，Edge Function 需要处理 `OPTIONS` 预检并返回允许的来源。
 
+## 7. 项目部署记录
+
+上线前填写：
+
+```text
+Supabase project ref:
+Supabase URL:
+Frontend deploy URL:
+Storage bucket: receipts
+Edge Function: parse-receipt
+```
+
+## 8. Storage Policy
+
+`docs/SUPABASE_SCHEMA.sql` 会创建私有 `receipts` bucket，并按对象路径第一段限制访问：
+
+```text
+{user_id}/{receipt_id}/original.ext
+```
+
+前端上传文件时必须使用该路径格式。Edge Function 使用 service role 读取原始文件并写回解析结果。
+

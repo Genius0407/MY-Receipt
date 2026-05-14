@@ -134,3 +134,39 @@ create trigger receipt_items_set_updated_at
 -- Recommended object path:
 -- receipts/{user_id}/{receipt_id}/original.ext
 
+insert into storage.buckets (id, name, public)
+values ('receipts', 'receipts', false)
+on conflict (id) do update set public = false;
+
+create policy "Users can read own receipt files"
+  on storage.objects for select
+  using (
+    bucket_id = 'receipts'
+    and (select auth.uid())::text = (storage.foldername(name))[1]
+  );
+
+create policy "Users can upload own receipt files"
+  on storage.objects for insert
+  with check (
+    bucket_id = 'receipts'
+    and (select auth.uid())::text = (storage.foldername(name))[1]
+  );
+
+create policy "Users can update own receipt files"
+  on storage.objects for update
+  using (
+    bucket_id = 'receipts'
+    and (select auth.uid())::text = (storage.foldername(name))[1]
+  )
+  with check (
+    bucket_id = 'receipts'
+    and (select auth.uid())::text = (storage.foldername(name))[1]
+  );
+
+create policy "Users can delete own receipt files"
+  on storage.objects for delete
+  using (
+    bucket_id = 'receipts'
+    and (select auth.uid())::text = (storage.foldername(name))[1]
+  );
+
