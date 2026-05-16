@@ -3,9 +3,9 @@ import type { ReceiptProcessingStage } from '../types/receipt'
 
 const stageLabels: Record<ReceiptProcessingStage, string> = {
   uploaded: 'Uploaded',
-  ocr_scanning: 'OCR scanning',
-  ai_extracting: 'AI extracting fields',
-  generating_preview: 'Generating preview',
+  ocr_scanning: 'OCR scanning...',
+  ai_extracting: 'AI extracting fields...',
+  generating_preview: 'Generating preview...',
   ready_for_review: 'Ready for review',
   ocr_failed: 'OCR failed',
 }
@@ -22,15 +22,16 @@ export function ProcessingPanel({ stage, status, compact = false }: ProcessingPa
   const activeStage = normalizeStage(stage, status)
   const activeIndex = stageOrder.indexOf(activeStage)
   const failed = activeStage === 'ocr_failed'
+  const activeIcon = getStageIcon(activeStage, status)
 
   return (
-    <div className={`rounded-2xl border ${failed ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-indigo-100 bg-indigo-50 text-indigo-700'} ${compact ? 'px-3 py-2' : 'p-4'}`}>
+    <div className={`rounded-2xl border ${failed ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-indigo-100 bg-indigo-50 text-indigo-700'} ${compact ? 'px-2.5 py-1.5' : 'p-4'}`}>
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           {failed ? <TriangleAlert className="h-4 w-4" /> : status === 'processing' || status === 'Processing' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Cpu className="h-4 w-4" />}
-          <span className="text-[10px] font-black uppercase tracking-wide">{stageLabels[activeStage]}</span>
+          <span className="text-[10px] font-black uppercase tracking-wide">{activeIcon} {stageLabels[activeStage]}</span>
         </div>
-        <span className="text-[10px] font-black uppercase opacity-70">{status || activeStage}</span>
+        {!compact && <span className="text-[10px] font-black uppercase opacity-70">{status || activeStage}</span>}
       </div>
       {!compact && (
         <div className="mt-3 grid grid-cols-5 gap-2">
@@ -49,6 +50,15 @@ export function ProcessingPanel({ stage, status, compact = false }: ProcessingPa
       )}
     </div>
   )
+}
+
+function getStageIcon(stage: ReceiptProcessingStage, status?: string | null) {
+  if (stage === 'ocr_failed') return '⚠'
+  if (stage === 'ocr_scanning' || status === 'processing' || status === 'Processing') return '🔍'
+  if (stage === 'ai_extracting') return '🧠'
+  if (stage === 'generating_preview') return '📊'
+  if (stage === 'ready_for_review') return '✅'
+  return '📄'
 }
 
 function normalizeStage(stage?: ReceiptProcessingStage | null, status?: string | null): ReceiptProcessingStage {

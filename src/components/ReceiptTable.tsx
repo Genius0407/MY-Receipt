@@ -10,6 +10,8 @@ import {
   RefreshCcw,
   Trash2,
 } from 'lucide-react'
+import { ProcessingPanel } from './ProcessingPanel'
+import { WarningPanel } from './WarningPanel'
 
 interface ReceiptTableLabels {
   merchantLabel: string
@@ -126,7 +128,7 @@ export function ReceiptTable({
                         </button>
                       )}
                     </div>
-                    <div className="flex gap-2">
+                    <div className="flex flex-wrap gap-2">
                       <span className={`text-[9px] font-bold uppercase ${config.colorMode === 'Dark' ? 'text-slate-600' : 'text-slate-400'}`}>
                         {item.status === 'Uploaded' ? 'Ready for crop and smart parse' : item.status === 'Processing' ? 'Smart parsing in background' : `INV: ${item.invoice_no || 'N/A'}`}
                       </span>
@@ -135,9 +137,10 @@ export function ReceiptTable({
                           <Copy className="h-3 w-3" />
                         </button>
                       )}
-                      {item.warnings?.length > 0 && (
-                        <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[8px] font-black uppercase text-amber-700">{item.warnings.length} warnings</span>
-                      )}
+                    </div>
+                    <div className="mt-2 flex max-w-xl flex-col gap-1.5">
+                      <ProcessingPanel stage={item.processing_stage} status={item.status} compact />
+                      <WarningPanel warnings={item.warnings} compact />
                     </div>
                   </div>
                 </div>
