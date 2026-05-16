@@ -54,10 +54,10 @@ export function ProcessingPanel({ stage, status, compact = false }: ProcessingPa
 
 function getStageIcon(stage: ReceiptProcessingStage, status?: string | null) {
   if (stage === 'ocr_failed') return '⚠'
-  if (stage === 'ocr_scanning' || status === 'processing' || status === 'Processing') return '🔍'
   if (stage === 'ai_extracting') return '🧠'
   if (stage === 'generating_preview') return '📊'
   if (stage === 'ready_for_review') return '✅'
+  if (stage === 'ocr_scanning' || status === 'processing' || status === 'Processing') return '🔍'
   return '📄'
 }
 

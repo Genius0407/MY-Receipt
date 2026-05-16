@@ -1106,23 +1106,27 @@ export default function App() {
 
     setSmartParsingReceiptId(receiptId);
     startRepairProgress(receiptId, 'smart');
-    showToast('正在执行智能解析：Qwen 视觉 + DeepSeek 校验...', 'info');
+    setSelectedReceipt(null);
+    setHistory((current) => current.map((item) => item.id === receiptId ? { ...item, status: 'Processing', processing_stage: 'ai_extracting' } : item));
+    showToast('智能解析已在后台开始，完成后会提示。', 'info');
 
     try {
       if (processedFile && imageProcessing) {
         const updated = await uploadProcessedReceiptImage(receiptId, processedFile, imageProcessing);
         const displayProcessingReceipt = await buildDisplayReceipt(updated, currentImageUrl);
-        setHistory((current) => current.map((item) => item.id === displayProcessingReceipt.id ? displayProcessingReceipt : item));
-        setSelectedReceipt(displayProcessingReceipt);
+        setHistory((current) => current.map((item) => item.id === displayProcessingReceipt.id ? {
+          ...displayProcessingReceipt,
+          status: 'Processing',
+          processing_stage: 'ai_extracting',
+        } : item));
       } else {
-        setSelectedReceipt((current: any) => current?.id === receiptId ? { ...current, status: 'Processing' } : current);
         setHistory((current) => current.map((item) => item.id === receiptId ? { ...item, status: 'Processing' } : item));
       }
 
       const result = await smartParseReceipt(receiptId, {
-        docType: selectedReceipt.doc_type,
+        docType: receipt.doc_type,
         enabledFieldKeys,
-        qrPayload: selectedReceipt.extra_fields?.qr_payload,
+        qrPayload: receipt.extra_fields?.qr_payload,
       });
       clearRepairProgressTimer();
       setRepairProgress({ receiptId, mode: 'smart', percent: 94, label: '同步智能解析结果到界面' });
@@ -1136,14 +1140,12 @@ export default function App() {
       });
 
       setHistory((current) => current.map((item) => item.id === displayReceipt.id ? displayReceipt : item));
-      setSelectedReceipt(displayReceipt);
       setRepairProgress({ receiptId, mode: 'smart', percent: 100, label: result.parseError ? '智能解析返回错误' : '智能解析完成' });
-      showToast(result.parseError || '智能解析完成。', result.parseError ? 'error' : 'success');
+      showToast(result.parseError || `${displayReceipt.merchant_name || displayReceipt.filename || 'Receipt'} 智能解析完成。`, result.parseError ? 'error' : 'success');
     } catch (error) {
       console.error('Smart parse failed:', error);
       clearRepairProgressTimer();
       setRepairProgress({ receiptId, mode: 'smart', percent: 100, label: '智能解析失败' });
-      setSelectedReceipt((current: any) => current?.id === receiptId ? { ...current, status: receipt.status || 'Uploaded' } : current);
       setHistory((current) => current.map((item) => item.id === receiptId ? { ...item, status: receipt.status || 'Uploaded' } : item));
       showToast(error instanceof Error ? error.message : 'Smart parse failed.', 'error');
     } finally {
