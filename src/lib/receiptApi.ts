@@ -1,19 +1,36 @@
 import { normalizeReceiptItem, normalizeReceiptPatch } from './normalizeReceipt'
 import { requireSupabase } from './supabaseClient'
 import type { Receipt, ReceiptFilters, ReceiptItem } from '../types/receipt'
+import type { ImageProcessingMetadata } from './imagePreprocess'
 
 export const RECEIPT_BUCKET = 'receipts'
 export const MAX_RECEIPT_FILE_SIZE_BYTES = 20 * 1024 * 1024
-export const ACCEPTED_RECEIPT_MIME_TYPES = ['image/jpeg', 'image/png', 'application/pdf']
+export const ACCEPTED_RECEIPT_MIME_TYPES = ['image/jpeg', 'image/png']
 
 export interface UploadedReceiptResult {
   receipt: Receipt
   parseError: string | null
 }
 
+export interface CreateReceiptFromFileOptions {
+  processedFile?: File | null
+  imageProcessing?: ImageProcessingMetadata | null
+  autoParse?: boolean
+  awaitParse?: boolean
+  parseMode?: ParseMode
+}
+
+export interface PollReceiptOptions {
+  intervalMs?: number
+  timeoutMs?: number
+  onPoll?: (receipt: Receipt) => void
+}
+
+export type ParseMode = 'ocr' | 'repair' | 'vision' | 'smart'
+
 export function validateReceiptFile(file: File): string | null {
   if (!ACCEPTED_RECEIPT_MIME_TYPES.includes(file.type)) {
-    return 'Only JPEG, PNG, and PDF receipts are supported.'
+    return 'Only JPEG and PNG receipts are supported.'
   }
 
   if (file.size > MAX_RECEIPT_FILE_SIZE_BYTES) {
@@ -23,7 +40,7 @@ export function validateReceiptFile(file: File): string | null {
   return null
 }
 
-export async function createReceiptFromFile(file: File): Promise<UploadedReceiptResult> {
+export async function createReceiptFromFile(file: File, options: CreateReceiptFromFileOptions = {}): Promise<UploadedReceiptResult> {
   const validationError = validateReceiptFile(file)
   if (validationError) {
     throw new Error(validationError)
@@ -50,23 +67,47 @@ export async function createReceiptFromFile(file: File): Promise<UploadedReceipt
 
   const receipt = inserted as Receipt
   const filePath = `${user.id}/${receipt.id}/original.${getFileExtension(file)}`
+  const processedFile = options.processedFile ?? null
+  const processedFilePath = processedFile ? `${user.id}/${receipt.id}/processed.${getFileExtension(processedFile)}` : null
 
-  const { error: uploadError } = await client.storage.from(RECEIPT_BUCKET).upload(filePath, file, {
-    contentType: file.type,
-    upsert: false,
-  })
+  if (processedFile) {
+    const processedValidationError = validateReceiptFile(processedFile)
+    if (processedValidationError) {
+      await markReceiptFailed(receipt.id, processedValidationError)
+      throw new Error(processedValidationError)
+    }
+  }
 
+  const uploads = [
+    client.storage.from(RECEIPT_BUCKET).upload(filePath, file, {
+      contentType: file.type,
+      upsert: false,
+    }),
+  ]
+
+  if (processedFile && processedFilePath) {
+    uploads.push(client.storage.from(RECEIPT_BUCKET).upload(processedFilePath, processedFile, {
+      contentType: processedFile.type,
+      upsert: false,
+    }))
+  }
+
+  const uploadResults = await Promise.all(uploads)
+  const uploadError = uploadResults.find((result) => result.error)?.error
   if (uploadError) {
     await markReceiptFailed(receipt.id, uploadError.message)
     throw uploadError
   }
 
+  const shouldAutoParse = options.autoParse !== false
   const { data: updated, error: updateError } = await client
     .from('receipts')
     .update({
       file_path: filePath,
+      processed_file_path: processedFilePath,
+      image_processing: options.imageProcessing ?? null,
       mime_type: file.type,
-      status: 'uploaded',
+      status: shouldAutoParse ? 'processing' : 'uploaded',
     })
     .eq('id', receipt.id)
     .select('*')
@@ -74,18 +115,42 @@ export async function createReceiptFromFile(file: File): Promise<UploadedReceipt
 
   if (updateError) throw updateError
 
-  const { error: functionError } = await client.functions.invoke('parse-receipt', {
-    body: { receipt_id: receipt.id },
-  })
-
-  if (functionError) {
-    const message = functionError.message || 'parse-receipt invocation failed'
-    const failed = await markReceiptFailed(receipt.id, message)
-    return { receipt: failed ?? (updated as Receipt), parseError: message }
+  if (!shouldAutoParse) {
+    return { receipt: updated as Receipt, parseError: null }
   }
+
+  if (options.awaitParse === false) {
+    void invokeReceiptParser(receipt.id, options.parseMode).catch((error) => {
+      console.error('parse-receipt async invocation failed:', error)
+    })
+    return { receipt: updated as Receipt, parseError: null }
+  }
+
+  const parseError = await invokeReceiptParser(receipt.id, options.parseMode)
+  if (parseError) return { receipt: (await getReceipt(receipt.id)) ?? (updated as Receipt), parseError }
 
   const refreshed = await getReceipt(receipt.id)
   return { receipt: refreshed ?? (updated as Receipt), parseError: null }
+}
+
+export async function pollReceiptUntilParsed(id: string, options: PollReceiptOptions = {}): Promise<Receipt> {
+  const intervalMs = options.intervalMs ?? 1800
+  const timeoutMs = options.timeoutMs ?? 90000
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() <= deadline) {
+    const receipt = await getReceipt(id)
+    if (!receipt) throw new Error('Receipt not found while polling parse result.')
+    options.onPoll?.(receipt)
+    if (!isReceiptParsing(receipt)) return receipt
+    await delay(intervalMs)
+  }
+
+  throw new Error(`OCR parsing is still running after ${Math.round(timeoutMs / 1000)} seconds.`)
+}
+
+export function isReceiptParsing(receipt: Pick<Receipt, 'status'>): boolean {
+  return receipt.status === 'uploaded' || receipt.status === 'processing'
 }
 
 export async function listReceipts(filters: ReceiptFilters = {}): Promise<Receipt[]> {
@@ -134,6 +199,79 @@ export async function getReceipt(id: string): Promise<Receipt | null> {
     throw error
   }
 
+  return data as Receipt
+}
+
+export async function repairReceiptWithDeepSeek(id: string): Promise<UploadedReceiptResult> {
+  const message = await invokeReceiptParser(id, 'repair')
+  if (message) {
+    const current = await getReceipt(id)
+    if (!current) throw new Error(message)
+    return { receipt: current, parseError: message }
+  }
+
+  const refreshed = await getReceipt(id)
+  if (!refreshed) throw new Error('Receipt not found after DeepSeek text repair.')
+  return { receipt: refreshed, parseError: null }
+}
+
+export async function reparseReceiptWithVision(id: string): Promise<UploadedReceiptResult> {
+  const message = await invokeReceiptParser(id, 'vision')
+  if (message) {
+    const current = await getReceipt(id)
+    if (!current) throw new Error(message)
+    return { receipt: current, parseError: message }
+  }
+
+  const refreshed = await getReceipt(id)
+  if (!refreshed) throw new Error('Receipt not found after Qwen vision reparse.')
+  return { receipt: refreshed, parseError: null }
+}
+
+export async function smartParseReceipt(id: string): Promise<UploadedReceiptResult> {
+  const message = await invokeReceiptParser(id, 'smart')
+  if (message) {
+    const current = await getReceipt(id)
+    if (!current) throw new Error(message)
+    return { receipt: current, parseError: message }
+  }
+
+  const refreshed = await getReceipt(id)
+  if (!refreshed) throw new Error('Receipt not found after smart parse.')
+  return { receipt: refreshed, parseError: null }
+}
+
+export async function uploadProcessedReceiptImage(
+  id: string,
+  processedFile: File,
+  imageProcessing: ImageProcessingMetadata,
+): Promise<Receipt> {
+  const validationError = validateReceiptFile(processedFile)
+  if (validationError) throw new Error(validationError)
+
+  const client = requireSupabase()
+  const user = await getCurrentUser()
+  const processedFilePath = `${user.id}/${id}/processed.${getFileExtension(processedFile)}`
+
+  const { error: uploadError } = await client.storage.from(RECEIPT_BUCKET).upload(processedFilePath, processedFile, {
+    contentType: processedFile.type,
+    upsert: true,
+  })
+  if (uploadError) throw uploadError
+
+  const { data, error } = await client
+    .from('receipts')
+    .update({
+      processed_file_path: processedFilePath,
+      image_processing: imageProcessing,
+      status: 'processing',
+      error_message: null,
+    })
+    .eq('id', id)
+    .select('*, receipt_items(*)')
+    .single()
+
+  if (error) throw error
   return data as Receipt
 }
 
@@ -202,8 +340,9 @@ export async function deleteReceipt(id: string): Promise<void> {
   const client = requireSupabase()
   const existing = await getReceipt(id)
 
-  if (existing?.file_path) {
-    const { error: storageError } = await client.storage.from(RECEIPT_BUCKET).remove([existing.file_path])
+  const paths = [existing?.file_path, existing?.processed_file_path].filter(Boolean) as string[]
+  if (paths.length > 0) {
+    const { error: storageError } = await client.storage.from(RECEIPT_BUCKET).remove(paths)
     if (storageError) throw storageError
   }
 
@@ -223,6 +362,19 @@ export async function createReceiptFileSignedUrl(filePath: string | null, expire
   }
 
   return data.signedUrl
+}
+
+async function invokeReceiptParser(id: string, mode?: ParseMode): Promise<string | null> {
+  const client = requireSupabase()
+  const { error } = await client.functions.invoke('parse-receipt', {
+    body: mode ? { receipt_id: id, mode } : { receipt_id: id },
+  })
+
+  if (!error) return null
+
+  const message = error.message || (mode === 'repair' ? 'DeepSeek text repair failed' : 'parse-receipt invocation failed')
+  await markReceiptFailed(id, message)
+  return message
 }
 
 async function markReceiptFailed(id: string, message: string): Promise<Receipt | null> {
@@ -266,8 +418,11 @@ function getFileExtension(file: File): string {
 function mimeToExtension(mimeType: string): string {
   if (mimeType === 'image/jpeg') return 'jpg'
   if (mimeType === 'image/png') return 'png'
-  if (mimeType === 'application/pdf') return 'pdf'
   return 'bin'
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, ms))
 }
 
 function escapeIlike(value: string): string {

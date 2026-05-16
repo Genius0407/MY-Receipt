@@ -12,9 +12,15 @@ import {
   createReceiptFromFile,
   deleteReceipt,
   listReceipts,
+  pollReceiptUntilParsed,
   saveReceipt,
+  smartParseReceipt,
+  uploadProcessedReceiptImage,
+  validateReceiptFile,
 } from './lib/receiptApi';
 import { downloadReceiptsXlsx } from './lib/exportExcel';
+import { ReceiptCropModal } from './components/ReceiptCropModal';
+import type { ImageProcessingMetadata } from './lib/imagePreprocess';
 
 // 初始模拟数据：完全覆盖 PRD V1.1 的所有字段与要求状态
 const INITIAL_HISTORY = [
@@ -62,6 +68,17 @@ const INITIAL_HISTORY = [
     rounding: 0,
     grand_total: 138.01,
     subsidy_info: 'Targeted Subsidy Applied (Budi Madani)',
+    subsidy_details: {
+      program: 'BUDI MADANI RON95',
+      pump_price: 4.27,
+      subsidy_price: 1.99,
+      subsidised_litre: 32.320,
+      government_subsidy: 73.69,
+      previous_balance_litre: 119.163,
+      remaining_balance_litre: 86.843,
+      gross_total: 138.01,
+      payable_total: 64.32
+    },
     doc_type: 'Receipt',
     industry: 'Fuel',
     tags: ['Business'],
@@ -130,23 +147,86 @@ const LANGUAGES = ['中文', 'English', 'Melayu'];
 const CURRENCIES = ['RM', 'SGD', 'USD', '¥'];
 
 const DISPLAY_STATUS_BY_DB_STATUS: Record<string, string> = {
-  uploaded: 'Pending',
-  processing: 'Pending',
+  uploaded: 'Uploaded',
+  processing: 'Processing',
   pending_review: 'Pending',
   synced: 'Synced',
   failed: 'Failed',
 };
 
 const DB_STATUS_BY_DISPLAY_STATUS: Record<string, string> = {
+  Uploaded: 'uploaded',
+  Processing: 'processing',
   Pending: 'pending_review',
   Synced: 'synced',
   Failed: 'failed',
 };
 
+type RepairProgress = {
+  receiptId: string;
+  percent: number;
+  label: string;
+  mode: 'deepseek' | 'vision' | 'smart';
+};
+
+type SmartCropTarget = {
+  receipt: any;
+  file: File;
+};
+
+type SubsidyDetails = Record<string, unknown> | null | undefined;
+
+function asSubsidyObject(details: SubsidyDetails) {
+  return details && typeof details === 'object' ? details : null;
+}
+
+function readSubsidyText(details: SubsidyDetails, keys: string[]) {
+  const object = asSubsidyObject(details);
+  if (!object) return '';
+  for (const key of keys) {
+    const value = object[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function readSubsidyNumber(details: SubsidyDetails, keys: string[]) {
+  const object = asSubsidyObject(details);
+  if (!object) return null;
+  for (const key of keys) {
+    const value = object[key];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim() !== '') {
+      const parsed = Number(value.replace(/[^\d.-]/g, ''));
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return null;
+}
+
+function hasSubsidyDetails(details: SubsidyDetails) {
+  const object = asSubsidyObject(details);
+  if (!object) return false;
+  return Object.values(object).some((value) => value !== null && value !== undefined && String(value).trim() !== '');
+}
+
+function formatSubsidyHeadline(details: SubsidyDetails) {
+  const program = readSubsidyText(details, ['program', 'scheme', 'name']);
+  const description = readSubsidyText(details, ['description', 'notes', 'note']);
+  const governmentSubsidy = readSubsidyNumber(details, ['government_subsidy', 'subsidy_amount']);
+  const payableTotal = readSubsidyNumber(details, ['payable_total', 'paid_total', 'opt', 'outstanding_payment_total']);
+
+  if (program && governmentSubsidy !== null && payableTotal !== null) {
+    return `${program}: subsidy RM ${governmentSubsidy.toFixed(2)}, payable RM ${payableTotal.toFixed(2)}`;
+  }
+  return program || description || '';
+}
+
 function toDisplayReceipt(receipt: any) {
   const items = receipt.receipt_items || receipt.items || [];
   const category = receipt.category || receipt.industry || 'Other';
   const tax = receipt.tax ?? receipt.tax_sst ?? 0;
+  const subsidyInfo = receipt.subsidy_info || formatSubsidyHeadline(receipt.subsidy_details);
 
   return {
     ...receipt,
@@ -155,8 +235,12 @@ function toDisplayReceipt(receipt: any) {
     industry: category,
     tax,
     tax_sst: tax,
-    subsidy_info: receipt.subsidy_info || receipt.subsidy_details?.description || '',
-    items,
+    subsidy_info: subsidyInfo,
+    items: items.map((item: any) => ({
+      ...item,
+      unit_price: Number(item.unit_price || 0),
+      line_total: Number(item.line_total || 0),
+    })),
   };
 }
 
@@ -187,11 +271,13 @@ const I18N: any = {
     dbTitle: 'Supabase 云端数据库',
     connected: 'Supabase 已连接',
     dragDrop: '拖拽上传 / 点击选择',
-    supportText: '支持 PDF, PNG, JPG。图片将自动上传至云端并提取数据。',
+    supportText: '支持 PNG, JPG。上传前可先裁剪票据区域。',
     processing: '云端处理引擎运行中',
     searchUpload: '搜索商户名或发票号...',
     searchDb: '在 Supabase 数据库中搜索...',
     statusAll: '状态: 全部',
+    statusUploaded: '待智能解析 (Uploaded)',
+    statusProcessing: '解析中 (Processing)',
     statusPending: '待核对 (Pending Sync)',
     statusFailed: '解析失败 (Failed)',
     typeAll: '单据类型: 全部',
@@ -253,7 +339,7 @@ const I18N: any = {
     archiveLib: '存档库',
     exportExcel: '导出 Excel',
     uploadHint: '拖拽上传新的单据',
-    uploadLimit: '单次最多上传 20 个文件',
+    uploadLimit: 'JPEG/PNG 可多选；先快速上传，进入单据后再裁剪并智能解析',
     searchPlaceholder: '搜索商户、发票号...',
     financialsLabel: '财务详情',
     tagsLabel: '分类标签',
@@ -288,11 +374,13 @@ const I18N: any = {
     dbTitle: 'Supabase Cloud Database',
     connected: 'Supabase Connected',
     dragDrop: 'Drag & Drop / Click to Upload',
-    supportText: 'Supports PDF, PNG, JPG. Images auto-upload to cloud & extract data.',
+    supportText: 'Supports PNG and JPG. Crop the receipt area before parsing.',
     processing: 'Cloud Engine Running...',
     searchUpload: 'Search merchant or invoice no...',
     searchDb: 'Search in Supabase database...',
     statusAll: 'Status: All',
+    statusUploaded: 'Ready to Parse',
+    statusProcessing: 'Processing',
     statusPending: 'Pending Sync',
     statusFailed: 'Failed to Parse',
     typeAll: 'Doc Type: All',
@@ -354,7 +442,7 @@ const I18N: any = {
     archiveLib: 'Archive Lib',
     exportExcel: 'Export Excel',
     uploadHint: 'Click or Drag to upload receipts',
-    uploadLimit: 'Up to 20 files at once',
+    uploadLimit: 'JPEG/PNG multi-upload; crop and smart parse from the receipt editor',
     searchPlaceholder: 'Search merchant, invoice...',
     financialsLabel: 'Financials',
     tagsLabel: 'Tags',
@@ -389,11 +477,13 @@ const I18N: any = {
     dbTitle: 'Pangkalan Data Awan Supabase',
     connected: 'Supabase Disambung',
     dragDrop: 'Tarik & Lepas / Klik untuk Muat Naik',
-    supportText: 'Sokong PDF, PNG, JPG. Imej akan dimuat naik & data diekstrak secara automatik.',
+    supportText: 'Sokong PNG dan JPG. Potong kawasan resit sebelum pengesanan.',
     processing: 'Enjin Awan Sedang Berjalan...',
     searchUpload: 'Cari saudagar atau no invois...',
     searchDb: 'Cari dalam pangkalan data...',
     statusAll: 'Status: Semua',
+    statusUploaded: 'Sedia Dihuraikan',
+    statusProcessing: 'Sedang Diproses',
     statusPending: 'Menunggu',
     statusFailed: 'Gagal Diekstrak',
     typeAll: 'Jenis Dokumen: Semua',
@@ -456,7 +546,7 @@ const I18N: any = {
     archiveLib: 'Arkib',
     exportExcel: 'Eksport Excel',
     uploadHint: 'Klik atau Tarik untuk muat naik resit',
-    uploadLimit: 'Hingga 20 fail sekaligus',
+    uploadLimit: 'JPEG/PNG berbilang fail; potong dan huraikan pintar dari editor',
     searchPlaceholder: 'Cari saudagar, invois...',
     financialsLabel: 'Kewangan',
     tagsLabel: 'Tag',
@@ -485,7 +575,14 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [selectedReceipt, setSelectedReceipt] = useState<any>(null);
   const [zoomImage, setZoomImage] = useState<string | null>(null);
+  const [imagePreviewMode, setImagePreviewMode] = useState<'processed' | 'original'>('processed');
   const [uploadList, setUploadList] = useState<any[]>([]);
+  const [smartCropTarget, setSmartCropTarget] = useState<SmartCropTarget | null>(null);
+  const [isCropModalBusy, setIsCropModalBusy] = useState(false);
+  const [smartParsingReceiptId, setSmartParsingReceiptId] = useState<string | null>(null);
+  const [repairProgress, setRepairProgress] = useState<RepairProgress | null>(null);
+  const repairProgressTimerRef = useRef<number | null>(null);
+  const pollingReceiptIdsRef = useRef<Set<string>>(new Set());
   const [newTagInput, setNewTagInput] = useState("");
   const [selectedRowIds, setSelectedRowIds] = useState<string[]>([]);
   const [toast, setToast] = useState<{message: string, type: 'info' | 'success' | 'error'} | null>(null);
@@ -506,6 +603,14 @@ export default function App() {
     localStorage.setItem('my_receipt_config', JSON.stringify(config));
   }, [config]);
 
+  useEffect(() => {
+    return () => {
+      if (repairProgressTimerRef.current) {
+        window.clearInterval(repairProgressTimerRef.current);
+      }
+    };
+  }, []);
+
   // Toast Function
   const showToast = (message: string, type: 'info' | 'success' | 'error' = 'info') => {
     setToast({ message, type });
@@ -517,6 +622,8 @@ export default function App() {
     const langKey = langMap[config.language] || 'English';
     return I18N[langKey];
   }, [config.language]);
+
+  const isSelectableForBulk = (receipt: any) => receipt.status === 'Pending' || receipt.status === 'Failed';
 
   const syncToDatabase = async (data: any) => {
     try {
@@ -534,15 +641,72 @@ export default function App() {
     }
   };
 
+  const buildDisplayReceipt = async (receipt: any, fallbackImageUrl?: string | null) => {
+    const originalSignedUrl = await createReceiptFileSignedUrl(receipt.file_path);
+    const processedSignedUrl = await createReceiptFileSignedUrl(receipt.processed_file_path || null);
+    return toDisplayReceipt({
+      ...receipt,
+      image_url: processedSignedUrl || originalSignedUrl || fallbackImageUrl || null,
+      original_image_url: originalSignedUrl,
+      processed_image_url: processedSignedUrl,
+    });
+  };
+
+  const upsertHistoryReceipt = (displayReceipt: any) => {
+    setHistory((current) => [displayReceipt, ...current.filter((receipt) => receipt.id !== displayReceipt.id)]);
+    setSelectedReceipt((current: any) => current?.id === displayReceipt.id ? displayReceipt : current);
+  };
+
+  const startReceiptResultPolling = (receiptId: string, fallbackImageUrl?: string | null, uploadId?: string) => {
+    if (pollingReceiptIdsRef.current.has(receiptId)) return;
+    pollingReceiptIdsRef.current.add(receiptId);
+
+    void (async () => {
+      try {
+        const finalReceipt = await pollReceiptUntilParsed(receiptId, {
+          intervalMs: 1800,
+          timeoutMs: 90000,
+          onPoll: (receipt) => {
+            if (receipt.status === 'processing' || receipt.status === 'uploaded') {
+              if (uploadId) {
+                setUploadList((old: any[]) => old.map((item) => item.id === uploadId
+                  ? { ...item, progress: Math.min(88, Math.max(item.progress || 0, 68)), status: 'OCR parsing in background' }
+                  : item));
+              }
+            }
+          },
+        });
+        const displayReceipt = await buildDisplayReceipt(finalReceipt, fallbackImageUrl);
+        upsertHistoryReceipt(displayReceipt);
+        if (finalReceipt.status === 'failed') {
+          showToast(finalReceipt.error_message || 'OCR parsing failed.', 'error');
+        } else {
+          showToast(`${finalReceipt.filename || 'Receipt'} OCR finished.`, 'success');
+        }
+      } catch (error) {
+        console.error('Receipt polling failed:', error);
+        showToast(error instanceof Error ? error.message : 'OCR parsing is still running.', 'info');
+      } finally {
+        pollingReceiptIdsRef.current.delete(receiptId);
+        if (uploadId) {
+          setUploadList((old: any[]) => old.filter((item) => item.id !== uploadId));
+        }
+        if (fallbackImageUrl?.startsWith('blob:')) {
+          URL.revokeObjectURL(fallbackImageUrl);
+        }
+      }
+    })();
+  };
+
   useEffect(() => {
     const loadData = async () => {
       try {
         const data = await listReceipts();
-        const displayData = await Promise.all(data.map(async (receipt) => {
-          const signedUrl = await createReceiptFileSignedUrl(receipt.file_path);
-          return toDisplayReceipt({ ...receipt, image_url: signedUrl });
-        }));
+        const displayData = await Promise.all(data.map((receipt) => buildDisplayReceipt(receipt)));
         setHistory(displayData);
+        data
+          .filter((receipt) => receipt.status === 'processing')
+          .forEach((receipt) => startReceiptResultPolling(receipt.id));
       } catch (error) {
         console.error('Error loading receipts:', error);
         showToast('Failed to load Supabase receipts.', 'error');
@@ -552,7 +716,7 @@ export default function App() {
   }, []);
 
   const handleToggleSelectAll = () => {
-    const currentPendingIds = filteredHistory.filter(h => h.status !== 'Synced').map(h => h.id);
+    const currentPendingIds = filteredHistory.filter(isSelectableForBulk).map(h => h.id);
     if (selectedRowIds.length === currentPendingIds.length) {
       setSelectedRowIds([]);
     } else {
@@ -562,6 +726,8 @@ export default function App() {
 
   const handleToggleSelectRow = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const receipt = history.find((item) => item.id === id);
+    if (receipt && !isSelectableForBulk(receipt)) return;
     setSelectedRowIds(prev => 
       prev.includes(id) ? prev.filter(rowId => rowId !== id) : [...prev, id]
     );
@@ -648,6 +814,45 @@ export default function App() {
       + (parseFloat(selectedReceipt.rounding) || 0);
   }, [selectedReceipt, itemsTotal]);
 
+  const selectedSubsidyDetails = useMemo(() => {
+    return asSubsidyObject(selectedReceipt?.subsidy_details);
+  }, [selectedReceipt]);
+
+  const selectedSubsidyPayable = useMemo(() => {
+    return readSubsidyNumber(selectedSubsidyDetails, ['payable_total', 'paid_total', 'opt', 'outstanding_payment_total']);
+  }, [selectedSubsidyDetails]);
+
+  const selectedSubsidyRows = useMemo(() => {
+    if (!selectedSubsidyDetails) return [];
+    const money = (value: number | null) => value === null ? '' : `${config.currency} ${value.toFixed(2)}`;
+    const litres = (value: number | null) => value === null ? '' : `${value.toFixed(3)} L`;
+    const rows = [
+      { label: '计划', value: readSubsidyText(selectedSubsidyDetails, ['program', 'scheme', 'name']) },
+      { label: '参考号', value: readSubsidyText(selectedSubsidyDetails, ['ref_no', 'reference_no']) },
+      { label: '原价', value: money(readSubsidyNumber(selectedSubsidyDetails, ['pump_price'])) },
+      { label: '补贴价', value: money(readSubsidyNumber(selectedSubsidyDetails, ['subsidy_price'])) },
+      { label: '补贴升数', value: litres(readSubsidyNumber(selectedSubsidyDetails, ['subsidised_litre', 'subsidized_litre', 'litres'])) },
+      { label: '政府补贴', value: money(readSubsidyNumber(selectedSubsidyDetails, ['government_subsidy', 'subsidy_amount'])) },
+      { label: '实付/OPT', value: money(selectedSubsidyPayable) },
+      { label: '补贴前余额', value: litres(readSubsidyNumber(selectedSubsidyDetails, ['previous_balance_litre', 'previous_balance'])) },
+      { label: '补贴后余额', value: litres(readSubsidyNumber(selectedSubsidyDetails, ['remaining_balance_litre', 'remaining_balance'])) },
+    ];
+    return rows.filter((row) => row.value);
+  }, [config.currency, selectedSubsidyDetails, selectedSubsidyPayable]);
+
+  useEffect(() => {
+    if (!selectedReceipt) return;
+    setImagePreviewMode(selectedReceipt.processed_image_url ? 'processed' : 'original');
+  }, [selectedReceipt?.id]);
+
+  const selectedReceiptImageUrl = useMemo(() => {
+    if (!selectedReceipt) return null;
+    if (imagePreviewMode === 'original') {
+      return selectedReceipt.original_image_url || selectedReceipt.image_url || null;
+    }
+    return selectedReceipt.processed_image_url || selectedReceipt.image_url || selectedReceipt.original_image_url || null;
+  }, [imagePreviewMode, selectedReceipt]);
+
   const handleExport = async (singleItem: any = null) => {
     let dataToExport = [];
     if (singleItem) {
@@ -669,49 +874,207 @@ export default function App() {
     setSelectedRowIds([]);
   };
 
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files) return;
-    const files = Array.from(e.target.files).slice(0, 20) as File[]; 
-    const newItems = files.map((file: File) => ({ 
-      id: Math.random().toString(36).substr(2, 9), 
-      name: file.name, 
-      status: 'Ready', 
-      progress: 0,
-      image_url: URL.createObjectURL(file),
-      file: file
-    }));
-    setUploadList(prev => [...newItems, ...prev]);
+    const files = Array.from(e.target.files).slice(0, 20) as File[];
+    e.target.value = '';
 
-    for (const item of newItems) {
-      setUploadList((old: any[]) => old.map(u => u.id === item.id ? { ...u, status: 'Uploading to Supabase', progress: 25 } : u));
+    const invalid = files.map(validateReceiptFile).find(Boolean);
+    if (invalid) {
+      showToast(invalid, 'error');
+      return;
+    }
 
-      try {
-        const result = await createReceiptFromFile(item.file);
-        setUploadList((old: any[]) => old.map(u => u.id === item.id ? { ...u, progress: 90, status: 'Waiting for AI result' } : u));
-        const signedUrl = await createReceiptFileSignedUrl(result.receipt.file_path);
-        const displayReceipt = toDisplayReceipt({
-          ...result.receipt,
-          image_url: signedUrl || item.image_url,
-        });
+    files.forEach((file) => {
+      void uploadOriginalReceipt(file);
+    });
+  };
 
-        setHistory((prev_history: any[]) => [displayReceipt, ...prev_history.filter((receipt) => receipt.id !== displayReceipt.id)]);
-        if (result.parseError) {
-          showToast(result.parseError, 'error');
-        } else {
-          showToast(`${item.name} uploaded.`, 'success');
-        }
-        setUploadList((old: any[]) => old.filter(u => u.id !== item.id));
-      } catch (error) {
-        console.error('Receipt upload failed:', error);
-        setUploadList((old: any[]) => old.map(u => u.id === item.id ? { ...u, status: 'Failed', progress: 100 } : u));
-        showToast(error instanceof Error ? error.message : 'Upload failed.', 'error');
-      }
+  const uploadOriginalReceipt = async (file: File) => {
+    const uploadId = Math.random().toString(36).substr(2, 9);
+    const previewUrl = URL.createObjectURL(file);
+    const uploadItem = {
+      id: uploadId,
+      name: file.name,
+      status: 'Uploading original receipt',
+      progress: 20,
+      image_url: previewUrl,
+      file,
+    };
+
+    setUploadList((prev) => [uploadItem, ...prev]);
+
+    try {
+      const result = await createReceiptFromFile(file, {
+        autoParse: false,
+      });
+      setUploadList((old: any[]) => old.map(u => u.id === uploadId ? { ...u, progress: 82, status: 'Creating review card' } : u));
+      const displayReceipt = await buildDisplayReceipt(result.receipt, previewUrl);
+
+      upsertHistoryReceipt(displayReceipt);
+      showToast(`${file.name} uploaded. Open it to crop and smart parse.`, 'success');
+      setUploadList((old: any[]) => old.filter((item) => item.id !== uploadId));
+      URL.revokeObjectURL(previewUrl);
+    } catch (error) {
+      console.error('Receipt upload failed:', error);
+      setUploadList((old: any[]) => old.map(u => u.id === uploadId ? { ...u, status: 'Failed', progress: 100 } : u));
+      showToast(error instanceof Error ? error.message : 'Upload failed.', 'error');
+      URL.revokeObjectURL(previewUrl);
     }
   };
 
   const handleRetry = (id: string) => {
     showToast(`Retrying API for ID: ${id}`, 'info');
     setHistory(history.filter(h => h.id !== id));
+  };
+
+  const clearRepairProgressTimer = () => {
+    if (repairProgressTimerRef.current) {
+      window.clearInterval(repairProgressTimerRef.current);
+      repairProgressTimerRef.current = null;
+    }
+  };
+
+  const startRepairProgress = (receiptId: string, mode: RepairProgress['mode'] = 'deepseek') => {
+    const stages = mode === 'smart'
+      ? [
+        { percent: 12, label: '上传裁剪图并准备智能解析' },
+        { percent: 28, label: 'Qwen 视觉模型正在读取票据图片' },
+        { percent: 48, label: '抽取商户、字段、金额和明细' },
+        { percent: 68, label: 'DeepSeek 正在校验结构和数学校验' },
+        { percent: 88, label: '写回云端并刷新审核页' },
+      ]
+      : mode === 'vision'
+      ? [
+        { percent: 14, label: '准备裁剪图并调用 Qwen VL' },
+        { percent: 32, label: 'Qwen VL 正在读取票据图片' },
+        { percent: 52, label: '提取商户、金额和商品明细' },
+        { percent: 72, label: 'DeepSeek 校验结构和数学校验' },
+        { percent: 88, label: '等待云函数写回视觉结果' },
+      ]
+      : [
+        { percent: 18, label: '连接 DeepSeek 修复引擎' },
+        { percent: 34, label: '发送 OCR 原文和初始结果' },
+        { percent: 56, label: '重排商户、日期、金额和明细' },
+        { percent: 74, label: '校验小计、舍入和总额' },
+        { percent: 86, label: '等待云函数写回结果' },
+      ];
+    let stageIndex = 0;
+
+    clearRepairProgressTimer();
+    setRepairProgress({
+      receiptId,
+      mode,
+      percent: 8,
+      label: mode === 'smart' ? '准备智能解析' : mode === 'vision' ? '准备 Qwen 视觉重解析' : '准备 DeepSeek 文本修复',
+    });
+
+    repairProgressTimerRef.current = window.setInterval(() => {
+      const nextStage = stages[stageIndex];
+      if (!nextStage) {
+        setRepairProgress((current) => {
+          if (!current || current.receiptId !== receiptId) return current;
+          return {
+            receiptId,
+            mode,
+            percent: Math.min(90, current.percent + 1),
+            label: mode === 'smart' ? '智能解析仍在处理，请稍候' : mode === 'vision' ? '视觉模型仍在处理，请稍候' : 'DeepSeek 仍在处理，请稍候',
+          };
+        });
+        return;
+      }
+      setRepairProgress({ receiptId, mode, ...nextStage });
+      stageIndex += 1;
+    }, 1100);
+  };
+
+  const handleSmartParse = async () => {
+    if (!selectedReceipt?.id || smartParsingReceiptId) return;
+
+    const imageUrl = selectedReceipt.original_image_url || selectedReceipt.image_url;
+    if (!imageUrl) {
+      showToast('This receipt has no image to parse.', 'error');
+      return;
+    }
+
+    try {
+      const response = await fetch(imageUrl);
+      if (!response.ok) throw new Error('Failed to load original receipt image for cropping.');
+      const blob = await response.blob();
+      const file = new File([blob], selectedReceipt.filename || `${selectedReceipt.id}.jpg`, {
+        type: blob.type || selectedReceipt.mime_type || 'image/jpeg',
+      });
+      setSmartCropTarget({ receipt: selectedReceipt, file });
+    } catch (error) {
+      console.error('Failed to prepare smart parse crop:', error);
+      showToast(error instanceof Error ? error.message : 'Failed to prepare smart parse.', 'error');
+    }
+  };
+
+  const handleSmartCropConfirm = (result: { processedFile: File | null; imageProcessing: ImageProcessingMetadata | null }) => {
+    const target = smartCropTarget;
+    if (!target) return;
+
+    setSmartCropTarget(null);
+    setIsCropModalBusy(false);
+    void runSmartParse(target.receipt, result.processedFile, result.imageProcessing);
+  };
+
+  const runSmartParse = async (
+    receipt: any,
+    processedFile: File | null,
+    imageProcessing: ImageProcessingMetadata | null,
+  ) => {
+    const receiptId = receipt.id;
+    const currentImageUrl = receipt.image_url;
+    const currentOriginalImageUrl = receipt.original_image_url;
+    const currentProcessedImageUrl = receipt.processed_image_url;
+
+    setSmartParsingReceiptId(receiptId);
+    startRepairProgress(receiptId, 'smart');
+    showToast('正在执行智能解析：Qwen 视觉 + DeepSeek 校验...', 'info');
+
+    try {
+      if (processedFile && imageProcessing) {
+        const updated = await uploadProcessedReceiptImage(receiptId, processedFile, imageProcessing);
+        const displayProcessingReceipt = await buildDisplayReceipt(updated, currentImageUrl);
+        setHistory((current) => current.map((item) => item.id === displayProcessingReceipt.id ? displayProcessingReceipt : item));
+        setSelectedReceipt(displayProcessingReceipt);
+      } else {
+        setSelectedReceipt((current: any) => current?.id === receiptId ? { ...current, status: 'Processing' } : current);
+        setHistory((current) => current.map((item) => item.id === receiptId ? { ...item, status: 'Processing' } : item));
+      }
+
+      const result = await smartParseReceipt(receiptId);
+      clearRepairProgressTimer();
+      setRepairProgress({ receiptId, mode: 'smart', percent: 94, label: '同步智能解析结果到界面' });
+      const originalSignedUrl = await createReceiptFileSignedUrl(result.receipt.file_path);
+      const processedSignedUrl = await createReceiptFileSignedUrl(result.receipt.processed_file_path || null);
+      const displayReceipt = toDisplayReceipt({
+        ...result.receipt,
+        image_url: processedSignedUrl || originalSignedUrl || currentImageUrl,
+        original_image_url: originalSignedUrl || currentOriginalImageUrl,
+        processed_image_url: processedSignedUrl || currentProcessedImageUrl,
+      });
+
+      setHistory((current) => current.map((item) => item.id === displayReceipt.id ? displayReceipt : item));
+      setSelectedReceipt(displayReceipt);
+      setImagePreviewMode(displayReceipt.processed_image_url ? 'processed' : 'original');
+      setRepairProgress({ receiptId, mode: 'smart', percent: 100, label: result.parseError ? '智能解析返回错误' : '智能解析完成' });
+      showToast(result.parseError || '智能解析完成。', result.parseError ? 'error' : 'success');
+    } catch (error) {
+      console.error('Smart parse failed:', error);
+      clearRepairProgressTimer();
+      setRepairProgress({ receiptId, mode: 'smart', percent: 100, label: '智能解析失败' });
+      setSelectedReceipt((current: any) => current?.id === receiptId ? { ...current, status: receipt.status || 'Uploaded' } : current);
+      setHistory((current) => current.map((item) => item.id === receiptId ? { ...item, status: receipt.status || 'Uploaded' } : item));
+      showToast(error instanceof Error ? error.message : 'Smart parse failed.', 'error');
+    } finally {
+      setSmartParsingReceiptId(null);
+      window.setTimeout(() => {
+        setRepairProgress((current) => current?.receiptId === receiptId ? null : current);
+      }, 1800);
+    }
   };
 
   const handleDelete = async (id: string, e?: React.MouseEvent) => {
@@ -730,6 +1093,10 @@ export default function App() {
     if (selectedReceipt?.id === id) setSelectedReceipt(null);
   };
 
+  const activeRepairProgress = selectedReceipt && repairProgress?.receiptId === selectedReceipt.id ? repairProgress : null;
+  const activeItemQualityWarning = selectedReceipt?.raw_ai?.parser_meta?.item_quality === 'low'
+    || /line item names look unreliable/i.test(selectedReceipt?.raw_ai?.parser_note || '');
+
   return (
     <div className={`min-h-screen flex flex-col font-sans transition-colors duration-300 ${config.colorMode === 'Dark' ? 'bg-slate-950 text-slate-100' : 'bg-[#F1F5F9] text-slate-900'}`}>
       {/* Toast Notification */}
@@ -744,6 +1111,21 @@ export default function App() {
            <Info className="w-5 h-5" />}
           <span className="text-sm font-black tracking-tight">{toast.message}</span>
         </div>
+      )}
+
+      {smartCropTarget && (
+        <ReceiptCropModal
+          file={smartCropTarget.file}
+          queueCount={1}
+          disabled={isCropModalBusy}
+          title="智能解析前裁剪"
+          description="先框住票据主体，再用 Qwen 视觉读取图片，并由 DeepSeek 校验结构、金额和字段。"
+          skipLabel="直接解析原图"
+          confirmLabel="裁剪并智能解析"
+          onCancel={() => setSmartCropTarget(null)}
+          onConfirm={handleSmartCropConfirm}
+          onError={(message) => showToast(message, 'error')}
+        />
       )}
 
       <div className="flex flex-1 overflow-hidden">
@@ -802,7 +1184,7 @@ export default function App() {
                   </div>
                   <h3 className={`text-lg font-black ${config.colorMode === 'Dark' ? 'text-slate-200' : 'text-slate-800'}`}>{t.uploadHint}</h3>
                   <p className={`text-xs mt-2 font-medium ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>{t.uploadLimit}</p>
-                  <input type="file" className="hidden" multiple onChange={handleUpload} accept="application/pdf,image/png,image/jpeg" />
+                  <input type="file" className="hidden" multiple onChange={handleUpload} accept="image/png,image/jpeg" />
                 </label>
 
                 {uploadList.length > 0 && (
@@ -840,6 +1222,8 @@ export default function App() {
                      <div className="relative">
                         <select value={filters.status} onChange={e => setFilters({...filters, status: e.target.value})} className={`appearance-none border rounded-xl pl-4 pr-10 py-2.5 text-xs font-black outline-none shadow-sm transition-all cursor-pointer ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800 text-slate-400 focus:border-indigo-500' : 'bg-white border-slate-200 text-slate-600 focus:border-indigo-500'}`}>
                            <option value="All">{t.statusAll}</option>
+                           <option value="Uploaded">{t.statusUploaded}</option>
+                           <option value="Processing">{t.statusProcessing}</option>
                            <option value="Pending">{t.statusPending}</option>
                            <option value="Failed">{t.statusFailed}</option>
                         </select>
@@ -870,7 +1254,7 @@ export default function App() {
                           <th className="px-6 py-4 w-10">
                             <input 
                               type="checkbox" 
-                              checked={selectedRowIds.length === filteredHistory.filter(h => h.status !== 'Synced').length && filteredHistory.filter(h => h.status !== 'Synced').length > 0}
+                              checked={selectedRowIds.length === filteredHistory.filter(isSelectableForBulk).length && filteredHistory.filter(isSelectableForBulk).length > 0}
                               onChange={handleToggleSelectAll}
                               className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
                             />
@@ -888,6 +1272,7 @@ export default function App() {
                               <input 
                                 type="checkbox" 
                                 checked={selectedRowIds.includes(item.id)}
+                                disabled={!isSelectableForBulk(item)}
                                 onChange={() => {}} // Handle via onClick of cell
                                 className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
                               />
@@ -895,12 +1280,24 @@ export default function App() {
                             <td className="px-6 py-5">
                                <div className="flex items-start gap-3">
                                   <div className="mt-0.5">
-                                     {item.status === 'Failed' ? <AlertCircle className="w-5 h-5 text-rose-500" /> : <CheckCircle className={`w-5 h-5 ${config.colorMode === 'Dark' ? 'text-amber-600' : 'text-amber-500'}`} />}
+                                     {item.status === 'Failed' ? (
+                                       <AlertCircle className="w-5 h-5 text-rose-500" />
+                                     ) : item.status === 'Processing' ? (
+                                       <Loader2 className={`w-5 h-5 animate-spin ${config.colorMode === 'Dark' ? 'text-indigo-400' : 'text-indigo-600'}`} />
+                                     ) : item.status === 'Uploaded' ? (
+                                       <Clock className={`w-5 h-5 ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`} />
+                                     ) : (
+                                       <CheckCircle className={`w-5 h-5 ${config.colorMode === 'Dark' ? 'text-amber-600' : 'text-amber-500'}`} />
+                                     )}
                                   </div>
                                   <div>
-                                    <p className={`text-sm font-black leading-tight mb-1 ${item.status === 'Failed' ? 'text-rose-600' : config.colorMode === 'Dark' ? 'text-slate-200' : 'text-slate-800'}`}>{item.merchant_name}</p>
+                                    <p className={`text-sm font-black leading-tight mb-1 ${item.status === 'Failed' ? 'text-rose-600' : config.colorMode === 'Dark' ? 'text-slate-200' : 'text-slate-800'}`}>
+                                      {item.merchant_name || item.filename || 'Processing receipt'}
+                                    </p>
                                     <div className="flex gap-2">
-                                       <span className={`text-[9px] font-bold uppercase ${config.colorMode === 'Dark' ? 'text-slate-600' : 'text-slate-400'}`}>INV: {item.invoice_no || 'N/A'}</span>
+                                       <span className={`text-[9px] font-bold uppercase ${config.colorMode === 'Dark' ? 'text-slate-600' : 'text-slate-400'}`}>
+                                         {item.status === 'Uploaded' ? 'Ready for crop and smart parse' : item.status === 'Processing' ? 'Smart parsing in background' : `INV: ${item.invoice_no || 'N/A'}`}
+                                       </span>
                                     </div>
                                   </div>
                                </div>
@@ -911,7 +1308,9 @@ export default function App() {
                             </td>
                             <td className="px-6 py-5">
                                <div className="flex flex-col gap-1.5 items-start">
-                                  <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase ${item.status === 'Failed' ? 'bg-rose-50 text-rose-600' : config.colorMode === 'Dark' ? 'bg-indigo-950 text-indigo-400' : 'bg-indigo-50 text-indigo-600'}`}>{item.doc_type}</span>
+                                  <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase ${item.status === 'Failed' ? 'bg-rose-50 text-rose-600' : item.status === 'Processing' ? 'bg-indigo-50 text-indigo-600' : config.colorMode === 'Dark' ? 'bg-indigo-950 text-indigo-400' : 'bg-indigo-50 text-indigo-600'}`}>
+                                    {item.status === 'Uploaded' ? 'Uploaded' : item.status === 'Processing' ? 'Processing' : item.doc_type}
+                                  </span>
                                   <div className="flex flex-wrap gap-1">
                                     {(item.tags || []).slice(0,2).map(t => <span key={t} className={`text-[8px] font-black uppercase px-1 rounded ${config.colorMode === 'Dark' ? 'bg-slate-800 text-slate-500' : 'bg-slate-100 text-slate-500'}`}>{t}</span>)}
                                   </div>
@@ -1000,7 +1399,7 @@ export default function App() {
                     </div>
                     <div>
                        <h2 className={`text-lg font-black tracking-tight flex items-center gap-2 ${config.colorMode === 'Dark' ? 'text-white' : 'text-slate-900'}`}>
-                          {selectedReceipt.merchant_name}
+                          {selectedReceipt.merchant_name || selectedReceipt.filename || 'Processing receipt'}
                           <span className={`px-2 py-0.5 rounded text-[9px] uppercase ${selectedReceipt.status === 'Failed' ? 'bg-rose-100 text-rose-700' : 'bg-emerald-100 text-emerald-700'}`}>
                              {t.confidence}: {(selectedReceipt.confidence_score * 100).toFixed(0)}%
                           </span>
@@ -1009,14 +1408,42 @@ export default function App() {
                     </div>
                  </div>
                  <div className="flex items-center gap-3">
+                    <button
+                       onClick={handleSmartParse}
+                       disabled={smartParsingReceiptId === selectedReceipt.id || selectedReceipt.status === 'Processing'}
+                       className={`px-5 py-2.5 border rounded-xl text-[10px] font-black flex items-center gap-2 transition-all shadow-sm disabled:opacity-60 disabled:cursor-wait ${config.colorMode === 'Dark' ? 'bg-indigo-950/60 border-indigo-900 text-indigo-300 hover:bg-indigo-900' : 'bg-indigo-50 border-indigo-100 text-indigo-700 hover:bg-indigo-100'}`}
+                    >
+                       <Cpu className={`w-3.5 h-3.5 ${smartParsingReceiptId === selectedReceipt.id ? 'animate-pulse' : ''}`} />
+                       {activeRepairProgress?.mode === 'smart' ? `智能解析 ${activeRepairProgress.percent}%` : selectedReceipt.status === 'Processing' ? '智能解析中' : '智能解析'}
+                    </button>
                     <button onClick={() => handleExport(selectedReceipt)} className={`px-4 py-2 border rounded-xl text-[10px] font-black flex items-center gap-2 transition-all shadow-sm ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
                        <FileOutput className="w-3.5 h-3.5" /> Export (XLSX)
                     </button>
-                    <button onClick={() => setSelectedReceipt(null)} className={`p-2 border rounded-full transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-slate-400 hover:bg-slate-700' : 'bg-white border-slate-200 text-slate-400 hover:bg-slate-100'}`}>
+                    <button onClick={() => setSelectedReceipt(null)} className={`p-2 border rounded-xl transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-slate-400 hover:bg-slate-700' : 'bg-white border-slate-200 text-slate-400 hover:bg-slate-100'}`} title="关闭编辑页">
                        <X className="w-5 h-5" />
                     </button>
                  </div>
               </div>
+
+              {activeRepairProgress && (
+                <div className={`px-8 py-3 border-b transition-colors ${config.colorMode === 'Dark' ? 'bg-indigo-950/30 border-indigo-900/50' : 'bg-indigo-50/80 border-indigo-100'}`}>
+                  <div className="flex items-center justify-between gap-4">
+                    <div className={`flex items-center gap-2 text-[10px] font-black uppercase tracking-wide ${config.colorMode === 'Dark' ? 'text-indigo-200' : 'text-indigo-700'}`}>
+                      <Cpu className="w-3.5 h-3.5 animate-pulse" />
+                      <span>{activeRepairProgress.label}</span>
+                    </div>
+                    <span className={`text-[10px] font-black tabular-nums ${config.colorMode === 'Dark' ? 'text-indigo-300' : 'text-indigo-700'}`}>
+                      {activeRepairProgress.percent}%
+                    </span>
+                  </div>
+                  <div className={`mt-2 h-1.5 rounded-full overflow-hidden ${config.colorMode === 'Dark' ? 'bg-slate-800' : 'bg-white'}`}>
+                    <div
+                      className="h-full rounded-full bg-indigo-600 transition-all duration-700 ease-out"
+                      style={{ width: `${activeRepairProgress.percent}%` }}
+                    />
+                  </div>
+                </div>
+              )}
 
               {/* 3列布局主内容区 */}
               <div className="flex-1 flex overflow-hidden">
@@ -1024,22 +1451,40 @@ export default function App() {
                  {/* 左侧：发票原图常驻预览 (25%) */}
                  <div className={`w-[25%] p-6 flex flex-col border-r relative transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-950/50 border-slate-800' : 'bg-slate-100/80 border-slate-200'}`}>
                     <h4 className={`text-[11px] font-black uppercase tracking-[2px] flex items-center gap-2 mb-4 ${config.colorMode === 'Dark' ? 'text-slate-600' : 'text-slate-500'}`}>
-                       <Eye className="w-4 h-4" /> {t.originalReceipt}
+                       <Eye className="w-4 h-4" /> {imagePreviewMode === 'processed' ? '识别图' : t.originalImg}
                     </h4>
+                    {selectedReceipt.processed_image_url && selectedReceipt.original_image_url && (
+                       <div className={`mb-4 grid grid-cols-2 gap-1 rounded-xl p-1 text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'bg-slate-900' : 'bg-white'}`}>
+                          <button
+                             type="button"
+                             onClick={() => setImagePreviewMode('processed')}
+                             className={`rounded-lg px-3 py-2 transition ${imagePreviewMode === 'processed' ? `${config.theme.color} text-white` : 'text-slate-500 hover:bg-slate-50'}`}
+                          >
+                             识别图
+                          </button>
+                          <button
+                             type="button"
+                             onClick={() => setImagePreviewMode('original')}
+                             className={`rounded-lg px-3 py-2 transition ${imagePreviewMode === 'original' ? `${config.theme.color} text-white` : 'text-slate-500 hover:bg-slate-50'}`}
+                          >
+                             原图
+                          </button>
+                       </div>
+                    )}
                     <div className={`flex-1 rounded-[24px] overflow-hidden border shadow-sm flex items-center justify-center relative group ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                       {selectedReceipt.image_url ? (
+                       {selectedReceiptImageUrl ? (
                           <>
                              <img 
-                               src={selectedReceipt.image_url} 
+                               src={selectedReceiptImageUrl}
                                onError={(e: any) => { e.target.onerror = null; e.target.src = '/input_file_2.png'; }} 
                                alt="Original Receipt" 
                                className="w-full h-full object-contain cursor-zoom-in" 
-                               onClick={() => setZoomImage(selectedReceipt.image_url)} 
+                               onClick={() => setZoomImage(selectedReceiptImageUrl)}
                                referrerPolicy="no-referrer"
                              />
                              
                              <button 
-                                onClick={() => setZoomImage(selectedReceipt.image_url)} 
+                                onClick={() => setZoomImage(selectedReceiptImageUrl)}
                                 className="absolute bottom-4 right-4 px-3 py-2 bg-slate-900/70 hover:bg-slate-900 text-white rounded-xl backdrop-blur-md opacity-0 group-hover:opacity-100 transition-all flex items-center gap-2 text-[10px] font-black uppercase shadow-xl"
                              >
                                 <ZoomIn className="w-4 h-4" /> {t.zoomTip}
@@ -1052,11 +1497,32 @@ export default function App() {
                           </div>
                        )}
                     </div>
-                    {selectedReceipt.subsidy_info && (
+                    {(selectedReceipt.subsidy_info || hasSubsidyDetails(selectedSubsidyDetails)) && (
                        <div className="mt-4 p-4 bg-amber-500/10 border border-amber-500/20 rounded-xl">
                           <p className={`text-[9px] font-black uppercase mb-1 ${config.colorMode === 'Dark' ? 'text-amber-500' : 'text-amber-700'}`}>政府补贴 / 援助金</p>
-                          <p className={`text-xs font-black leading-tight ${config.colorMode === 'Dark' ? 'text-amber-200' : 'text-amber-900'}`}>{selectedReceipt.subsidy_info}</p>
+                          <p className={`text-xs font-black leading-tight ${config.colorMode === 'Dark' ? 'text-amber-200' : 'text-amber-900'}`}>{selectedReceipt.subsidy_info || formatSubsidyHeadline(selectedSubsidyDetails)}</p>
+                          {selectedSubsidyRows.length > 0 && (
+                            <div className="mt-3 grid grid-cols-2 gap-2">
+                              {selectedSubsidyRows.slice(0, 6).map((row) => (
+                                <div key={row.label} className={`rounded-lg px-2 py-1.5 ${config.colorMode === 'Dark' ? 'bg-slate-950/40' : 'bg-white/70'}`}>
+                                  <p className="text-[8px] font-black uppercase text-slate-400">{row.label}</p>
+                                  <p className={`truncate text-[10px] font-black ${config.colorMode === 'Dark' ? 'text-slate-100' : 'text-slate-800'}`}>{row.value}</p>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                        </div>
+                    )}
+                    {(selectedReceipt.raw_ocr || selectedReceipt.raw_ai?.parser_note) && (
+                       <details className={`mt-4 rounded-xl border p-4 text-xs ${config.colorMode === 'Dark' ? 'border-slate-800 bg-slate-900 text-slate-400' : 'border-slate-200 bg-white text-slate-500'}`}>
+                          <summary className="cursor-pointer text-[10px] font-black uppercase tracking-widest text-slate-500">OCR 原文 / 解析说明</summary>
+                          {selectedReceipt.raw_ai?.parser_note && (
+                             <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-[10px] font-bold leading-5 text-amber-700">{selectedReceipt.raw_ai.parser_note}</p>
+                          )}
+                          {selectedReceipt.raw_ocr && (
+                             <pre className="mt-3 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-950 p-3 text-[10px] leading-5 text-slate-100">{selectedReceipt.raw_ocr}</pre>
+                          )}
+                       </details>
                     )}
                  </div>
 
@@ -1071,28 +1537,28 @@ export default function App() {
                           </h4>
                           <div className="grid grid-cols-4 gap-6">
                              {/* 基础信息区 */}
-                             <div className="col-span-4 lg:col-span-3 grid grid-cols-3 gap-4">
-                                <div className="col-span-2 space-y-1.5">
+                             <div className="col-span-4 lg:col-span-3 grid grid-cols-6 gap-4">
+                                <div className="col-span-6 xl:col-span-4 space-y-1.5">
                                    <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>商户名称 (Merchant)</label>
                                    <input type="text" value={selectedReceipt.merchant_name || ''} onChange={(e) => setSelectedReceipt({...selectedReceipt, merchant_name: e.target.value})} className={`w-full border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
                                 </div>
-                                <div className="space-y-1.5">
+                                <div className="col-span-6 sm:col-span-2 xl:col-span-2 space-y-1.5">
                                    <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>日期 (Date)</label>
                                    <input type="text" value={selectedReceipt.date || ''} onChange={(e) => setSelectedReceipt({...selectedReceipt, date: e.target.value})} className={`w-full border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
                                 </div>
-                                <div className="space-y-1.5">
+                                <div className="col-span-6 xl:col-span-2 space-y-1.5">
                                    <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>发票号 (Invoice No)</label>
                                    <input type="text" value={selectedReceipt.invoice_no || ''} onChange={(e) => setSelectedReceipt({...selectedReceipt, invoice_no: e.target.value})} className={`w-full border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
                                 </div>
-                                <div className="space-y-1.5">
+                                <div className="col-span-6 xl:col-span-2 space-y-1.5">
                                    <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>注册号 (Reg No)</label>
                                    <input type="text" value={selectedReceipt.company_reg_no || ''} onChange={(e) => setSelectedReceipt({...selectedReceipt, company_reg_no: e.target.value})} className={`w-full border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
                                 </div>
-                                <div className="space-y-1.5">
+                                <div className="col-span-6 xl:col-span-2 space-y-1.5">
                                    <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>SST ID</label>
                                    <input type="text" value={selectedReceipt.sst_no || ''} onChange={(e) => setSelectedReceipt({...selectedReceipt, sst_no: e.target.value})} className={`w-full border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
                                 </div>
-                                <div className="col-span-2 space-y-1.5">
+                                <div className="col-span-6 xl:col-span-4 space-y-1.5">
                                    <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>电话 (Phone) & 支付 (Payment)</label>
                                    <div className="flex gap-2">
                                       <input type="text" value={selectedReceipt.phone || ''} placeholder="Phone" onChange={(e) => setSelectedReceipt({...selectedReceipt, phone: e.target.value})} className={`w-1/2 border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
@@ -1106,13 +1572,13 @@ export default function App() {
                                 <div className="space-y-1.5">
                                    <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>单据类型 & 行业</label>
                                    <div className="flex gap-2">
-                                       <div className="relative w-1/2">
+                                       <div className="relative min-w-32 flex-1">
                                           <select value={selectedReceipt.doc_type} onChange={(e) => setSelectedReceipt({...selectedReceipt, doc_type: e.target.value})} className={`w-full appearance-none border rounded-xl pl-3 pr-8 py-2.5 text-xs font-black outline-none focus:ring-2 transition-all cursor-pointer ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20 focus:bg-slate-700' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10 focus:bg-white'}`}>
                                              {DOC_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
                                           </select>
                                           <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 w-3 h-3 text-slate-400 pointer-events-none" />
                                        </div>
-                                       <div className="relative w-1/2">
+                                       <div className="relative min-w-28 flex-1">
                                           <select value={selectedReceipt.industry} onChange={(e) => setSelectedReceipt({...selectedReceipt, industry: e.target.value})} className={`w-full appearance-none border rounded-xl pl-3 pr-8 py-2.5 text-xs font-black outline-none focus:ring-2 transition-all cursor-pointer ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20 focus:bg-slate-700' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10 focus:bg-white'}`}>
                                              {INDUSTRIES.map(t => <option key={t} value={t}>{t}</option>)}
                                           </select>
@@ -1149,6 +1615,14 @@ export default function App() {
                              <Plus className="w-3.5 h-3.5" /> SKU
                           </button>
                        </div>
+                       {activeItemQualityWarning && (
+                          <div className={`mb-4 rounded-xl border px-4 py-3 text-[10px] font-bold leading-5 ${config.colorMode === 'Dark' ? 'border-amber-800 bg-amber-950/30 text-amber-200' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+                             <div className="flex items-start gap-2">
+                                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                                <span>DeepSeek 已完成文本修复，但商品明细名称质量偏低。当前 OCR 文本可能已经损坏，请对照左侧图片人工补全，或改用视觉模型重解析。</span>
+                             </div>
+                          </div>
+                       )}
                        
                        <div className={`border rounded-[20px] overflow-hidden shadow-sm flex-1 transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
                           <table className="w-full text-left text-sm">
@@ -1168,10 +1642,10 @@ export default function App() {
                                          <input type="text" value={item.name || ''} onChange={(e) => updateItem(item.id, 'name', e.target.value)} placeholder="名称" className={`w-full bg-transparent border-none p-1.5 text-xs font-black focus:ring-1 rounded ${config.colorMode === 'Dark' ? 'text-slate-300 focus:ring-slate-700 focus:bg-slate-800' : 'text-slate-700 focus:ring-slate-200 focus:bg-white'}`} />
                                       </td>
                                       <td className="px-3 py-2">
-                                         <input type="number" value={item.qty === 0 ? '' : item.qty} onChange={(e) => updateItem(item.id, 'qty', e.target.value)} className={`w-full bg-transparent border-none p-1.5 text-xs font-black focus:ring-1 rounded text-center ${config.colorMode === 'Dark' ? 'text-slate-400 focus:ring-slate-700 focus:bg-slate-800' : 'text-slate-600 focus:ring-slate-200 focus:bg-white'}`} />
+                                         <input type="number" step="0.001" value={item.qty === 0 ? '' : item.qty} onChange={(e) => updateItem(item.id, 'qty', e.target.value)} className={`w-full bg-transparent border-none p-1.5 text-xs font-black focus:ring-1 rounded text-center ${config.colorMode === 'Dark' ? 'text-slate-400 focus:ring-slate-700 focus:bg-slate-800' : 'text-slate-600 focus:ring-slate-200 focus:bg-white'}`} />
                                       </td>
                                       <td className="px-3 py-2">
-                                         <input type="number" value={item.unit_price === 0 ? '' : item.unit_price} onChange={(e) => updateItem(item.id, 'unit_price', e.target.value)} className={`w-full bg-transparent border-none p-1.5 text-xs font-black focus:ring-1 rounded text-right ${config.colorMode === 'Dark' ? 'text-slate-400 focus:ring-slate-700 focus:bg-slate-800' : 'text-slate-600 focus:ring-slate-200 focus:bg-white'}`} />
+                                         <input type="number" step="0.01" value={item.unit_price === 0 ? '' : item.unit_price} onChange={(e) => updateItem(item.id, 'unit_price', e.target.value)} onBlur={(e) => updateItem(item.id, 'unit_price', (parseFloat(e.target.value) || 0).toFixed(2))} className={`w-full bg-transparent border-none p-1.5 text-xs font-black focus:ring-1 rounded text-right ${config.colorMode === 'Dark' ? 'text-slate-400 focus:ring-slate-700 focus:bg-slate-800' : 'text-slate-600 focus:ring-slate-200 focus:bg-white'}`} />
                                       </td>
                                       <td className={`px-5 py-2 text-right text-xs font-black ${config.colorMode === 'Dark' ? 'text-white' : 'text-slate-900'}`}>{item.line_total.toFixed(2)}</td>
                                       <td className="px-3 py-2 text-center">
@@ -1219,6 +1693,33 @@ export default function App() {
                              <input type="number" value={selectedReceipt.change === 0 ? '' : selectedReceipt.change} onChange={(e) => setSelectedReceipt({...selectedReceipt, change: e.target.value})} className={`w-full border rounded-lg px-3 py-2.5 text-right outline-none focus:ring-1 ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-100 focus:ring-slate-200'}`} placeholder="0" />
                           </div>
                        </div>
+
+                       {selectedSubsidyRows.length > 0 && (
+                         <div className={`rounded-2xl border p-5 ${config.colorMode === 'Dark' ? 'border-amber-900/50 bg-amber-950/20' : 'border-amber-100 bg-amber-50/60'}`}>
+                           <div className="flex items-start justify-between gap-4">
+                             <div>
+                               <p className={`text-[10px] font-black uppercase tracking-[2px] ${config.colorMode === 'Dark' ? 'text-amber-400' : 'text-amber-700'}`}>燃油补贴 / Budi Madani</p>
+                               <p className={`mt-1 text-xs font-bold ${config.colorMode === 'Dark' ? 'text-amber-100' : 'text-amber-900'}`}>
+                                 票面总额保留在 Grand Total，客户实际支付金额单独展示，避免把政府补贴误当普通折扣。
+                               </p>
+                             </div>
+                             {selectedSubsidyPayable !== null && (
+                               <div className={`min-w-40 rounded-xl px-4 py-3 text-right ${config.colorMode === 'Dark' ? 'bg-slate-950/50' : 'bg-white'}`}>
+                                 <p className="text-[9px] font-black uppercase text-slate-400">实际支付 / OPT</p>
+                                 <p className={`text-2xl font-black ${config.colorMode === 'Dark' ? 'text-white' : 'text-slate-900'}`}>{config.currency} {selectedSubsidyPayable.toFixed(2)}</p>
+                               </div>
+                             )}
+                           </div>
+                           <div className="mt-4 grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3">
+                             {selectedSubsidyRows.map((row) => (
+                               <div key={row.label} className={`rounded-xl px-3 py-2 ${config.colorMode === 'Dark' ? 'bg-slate-950/40' : 'bg-white/80'}`}>
+                                 <p className="text-[9px] font-black uppercase text-slate-400">{row.label}</p>
+                                 <p className={`mt-0.5 truncate text-xs font-black ${config.colorMode === 'Dark' ? 'text-slate-100' : 'text-slate-800'}`}>{row.value}</p>
+                               </div>
+                             ))}
+                           </div>
+                         </div>
+                       )}
                        
                        <div className={`pt-6 border-t flex items-center justify-between ${config.colorMode === 'Dark' ? 'border-slate-800' : 'border-slate-100'}`}>
                           <div>

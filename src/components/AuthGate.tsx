@@ -43,6 +43,16 @@ export function AuthGate({ children }: AuthGateProps) {
     setMessage(error ? error.message : '登录链接已发送，请检查邮箱。')
   }
 
+  async function signInAnonymously() {
+    if (!supabase) return
+
+    setLoading(true)
+    setMessage(null)
+    const { error } = await supabase.auth.signInAnonymously()
+    setLoading(false)
+    setMessage(error ? error.message : null)
+  }
+
   async function signOut() {
     if (!supabase) return
     await supabase.auth.signOut()
@@ -55,7 +65,7 @@ export function AuthGate({ children }: AuthGateProps) {
           <h1 className="text-lg font-black">缺少 Supabase 配置</h1>
           <p className="mt-3 text-sm leading-6 text-slate-600">
             请先配置 `VITE_SUPABASE_URL` 和 `VITE_SUPABASE_ANON_KEY`。前端只允许使用 anon key；
-            OpenAI、Google Vision、service role key 必须放在 Supabase Edge Function Secrets。
+            腾讯云 OCR、OpenAI、service role key 必须放在 Supabase Edge Function Secrets。
           </p>
         </div>
       </div>
@@ -75,8 +85,21 @@ export function AuthGate({ children }: AuthGateProps) {
       <div className="grid min-h-screen place-items-center bg-slate-100 px-6 text-slate-900">
         <div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-8 shadow-sm">
           <h1 className="text-xl font-black">MY-Receipt</h1>
-          <p className="mt-2 text-sm text-slate-500">使用邮箱 magic link 登录后继续处理收据。</p>
+          <p className="mt-2 text-sm text-slate-500">匿名试用可直接进入；邮箱登录用于保留长期账号。</p>
           <div className="mt-6 space-y-3">
+            <button
+              type="button"
+              onClick={signInAnonymously}
+              disabled={loading}
+              className="w-full rounded-xl bg-indigo-600 px-4 py-3 text-sm font-black text-white disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              匿名试用
+            </button>
+            <div className="flex items-center gap-3">
+              <div className="h-px flex-1 bg-slate-200" />
+              <span className="text-[10px] font-black uppercase text-slate-400">或使用邮箱</span>
+              <div className="h-px flex-1 bg-slate-200" />
+            </div>
             <input
               type="email"
               value={email}
@@ -88,7 +111,7 @@ export function AuthGate({ children }: AuthGateProps) {
               type="button"
               onClick={sendMagicLink}
               disabled={loading || !email.trim()}
-              className="w-full rounded-xl bg-indigo-600 px-4 py-3 text-sm font-black text-white disabled:cursor-not-allowed disabled:opacity-50"
+              className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-black text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
             >
               发送登录链接
             </button>
@@ -101,7 +124,7 @@ export function AuthGate({ children }: AuthGateProps) {
 
   return (
     <>
-      <div className="fixed right-4 top-4 z-[300]">
+      <div className="fixed right-6 top-3 z-30">
         <button
           type="button"
           onClick={signOut}
@@ -114,4 +137,3 @@ export function AuthGate({ children }: AuthGateProps) {
     </>
   )
 }
-

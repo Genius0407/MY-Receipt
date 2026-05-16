@@ -58,4 +58,55 @@ describe('flattenReceipts', () => {
       item_line_total: 20,
     })
   })
+
+  it('exports fuel subsidy fields separately from grand total', () => {
+    const rows = flattenReceipts([
+      {
+        id: 'receipt-fuel',
+        user_id: 'user-1',
+        filename: 'shell.jpg',
+        mime_type: 'image/jpeg',
+        file_path: 'user-1/receipt-fuel/original.jpg',
+        status: 'pending_review',
+        merchant_name: 'APPLE LEAF ENTERPRISE',
+        company_reg_no: 'PG0187462-K',
+        address: null,
+        phone: null,
+        invoice_no: 'IRF150NDW',
+        date: '2026-04-14',
+        time: null,
+        category: 'Fuel',
+        doc_type: 'Receipt',
+        subtotal: 138.01,
+        discount: 0,
+        tax: 0,
+        service_charge: 0,
+        rounding: 0,
+        grand_total: 138.01,
+        payment_method: 'VISA',
+        change: 0,
+        subsidy_details: {
+          program: 'BUDI MADANI RON95',
+          government_subsidy: 73.69,
+          payable_total: 64.32,
+        },
+        tags: ['Business'],
+        confidence_score: 0.9,
+        error_message: null,
+        processed_at: null,
+        created_at: '2026-05-14T00:00:00Z',
+        updated_at: '2026-05-14T00:00:00Z',
+        receipt_items: [
+          { name: 'FuelSave 95', qty: 32.32, unit: 'L', unit_price: 4.27, line_total: 138.01 },
+        ],
+      } satisfies Receipt,
+    ])
+
+    expect(rows[0]).toMatchObject({
+      grand_total: 138.01,
+      subsidy_program: 'BUDI MADANI RON95',
+      government_subsidy: 73.69,
+      payable_total: 64.32,
+    })
+  })
 })

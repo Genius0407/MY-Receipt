@@ -24,30 +24,61 @@ VITE_SUPABASE_ANON_KEY=
 
 ```text
 OPENAI_API_KEY
-GOOGLE_VISION_KEY
+USE_OPENAI_VISION
+OCR_PROVIDER
+TENCENT_SECRET_ID
+TENCENT_SECRET_KEY
+OCR_FREE_MONTHLY_LIMIT
+DASHSCOPE_API_KEY
+VISION_PROVIDER
+QWEN_VL_MODEL
+VISION_MONTHLY_LIMIT
+AI_REPAIR_PROVIDER
+DEEPSEEK_API_KEY
+DEEPSEEK_MODEL
+DEEPSEEK_MONTHLY_LIMIT
 SUPABASE_SERVICE_ROLE_KEY
 DATABASE_URL
 ```
 
 ## 3. Supabase Edge Function Secrets
 
-以下密钥只存入 Supabase Edge Function Secrets：
+腾讯云 OCR 模式下，以下密钥只存入 Supabase Edge Function Secrets：
 
 ```text
-OPENAI_API_KEY
-GOOGLE_VISION_KEY
-SUPABASE_SERVICE_ROLE_KEY
+OCR_PROVIDER=tencent
+TENCENT_SECRET_ID
+TENCENT_SECRET_KEY
+OCR_FREE_MONTHLY_LIMIT=900
+AI_REPAIR_PROVIDER=deepseek  # 可选：腾讯 OCR 后低成本文本修复
+DEEPSEEK_API_KEY             # 可选：DeepSeek V4 文本修复
+DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_MONTHLY_LIMIT=500
+DASHSCOPE_API_KEY          # 仅高精度重解析需要
+VISION_PROVIDER=qwen       # 仅高精度重解析需要
+QWEN_VL_MODEL=qwen3.6-plus
+VISION_MONTHLY_LIMIT=100
 ```
 
 设置示例：
 
 ```bash
-supabase secrets set OPENAI_API_KEY=<openai-api-key>
-supabase secrets set GOOGLE_VISION_KEY=xxx
-supabase secrets set SUPABASE_SERVICE_ROLE_KEY=xxx
+supabase secrets set OCR_PROVIDER=tencent
+supabase secrets set TENCENT_SECRET_ID=<tencent-secret-id>
+supabase secrets set TENCENT_SECRET_KEY=<tencent-secret-key>
+supabase secrets set OCR_FREE_MONTHLY_LIMIT=900
+supabase secrets set AI_REPAIR_PROVIDER=deepseek
+supabase secrets set DEEPSEEK_API_KEY=<deepseek-api-key>
+supabase secrets set DEEPSEEK_MODEL=deepseek-v4-flash
+supabase secrets set DEEPSEEK_MONTHLY_LIMIT=500
+supabase secrets set VISION_PROVIDER=qwen
+supabase secrets set VISION_REPAIR_PROVIDER=deepseek
+supabase secrets set DASHSCOPE_API_KEY=<dashscope-api-key>
+supabase secrets set QWEN_VL_MODEL=qwen3.6-plus
+supabase secrets set VISION_MONTHLY_LIMIT=100
 ```
 
-本地开发可以使用 `.env.local`，但必须加入 `.gitignore`。仓库只保留 `.env.example`。
+DeepSeek V4 默认处理腾讯 OCR 文本；当明细为空、金额校验失败或置信度偏低时自动修复一次，并通过 `consume_ocr_quota` 默认限制每用户每月 500 次。高精度重解析不会自动调用，只有用户在审核页点击“Qwen 视觉重解析”时才会使用 Qwen VL，并默认限制每用户每月 100 次；如果设置 `VISION_REPAIR_PROVIDER=deepseek`，Qwen 视觉 JSON 会再交给 DeepSeek 做结构和数学校验，但不会让 DeepSeek 重写商品名。若后续要启用 OpenAI Vision，可额外设置 `OPENAI_API_KEY` 和 `USE_OPENAI_VISION=true`。`SUPABASE_SERVICE_ROLE_KEY` 是 Supabase Edge Functions 的内置环境变量，不要在 Supabase Dashboard 手动创建 `SUPABASE_` 前缀的 secret。本地开发可以使用 `.env.local`，但必须加入 `.gitignore`。仓库只保留 `.env.example`。
 
 ## 4. Supabase 资源
 
@@ -56,10 +87,22 @@ supabase secrets set SUPABASE_SERVICE_ROLE_KEY=xxx
 1. Supabase Auth。
 2. Storage bucket：`receipts`。
 3. Postgres 表：`receipts`、`receipt_items`。
-4. RLS policies。
-5. Edge Function：`parse-receipt`。
+4. OCR quota 表与 `consume_ocr_quota` RPC。
+5. `receipts.processed_file_path` 与 `receipts.image_processing`，用于保存上传前裁剪图和裁剪参数。
+6. Edge Function：`parse-receipt`。
 
 数据库和 RLS 参考 [SUPABASE_SCHEMA.sql](./SUPABASE_SCHEMA.sql)。
+
+如果线上库已经执行过旧版 schema，先在 Supabase SQL Editor 执行：
+
+```sql
+-- docs/ADD_IMAGE_PREPROCESSING.sql
+alter table public.receipts
+  add column if not exists processed_file_path text;
+
+alter table public.receipts
+  add column if not exists image_processing jsonb;
+```
 
 ## 5. 公网安全要求
 
@@ -68,10 +111,12 @@ supabase secrets set SUPABASE_SERVICE_ROLE_KEY=xxx
 - 所有业务表启用 RLS。
 - Storage bucket 默认不公开。
 - Storage policy 限制用户只能访问 `receipts/{auth.uid()}/...`。
-- Edge Function 校验 JWT，不接受匿名 OCR/AI 请求。
+- Edge Function 校验 JWT，不接受匿名解析请求。
 - Edge Function 调用前检查 `receipt_id` 所属用户。
-- OpenAI/Google/Supabase service role key 不进入前端包。
-- 对单用户 OCR/AI 调用量做基础限制，避免盗刷。
+- 腾讯云 SecretId/SecretKey、OpenAI key、OpenAI 开关和 Supabase service role key 不进入前端包。
+- 腾讯云 OCR 经 `consume_ocr_quota` 硬限制每用户每月最多 900 次，避免超出免费资源包。
+- DeepSeek V4 文本修复只处理 OCR 文本，不上传图片，默认每用户每月最多 500 次。
+- Qwen VL 高精度重解析只在人工点击时触发，并经 `consume_ocr_quota` 硬限制每用户每月最多 100 次。
 
 ## 6. CORS
 
@@ -103,9 +148,10 @@ Edge Function: parse-receipt
 
 ```text
 {user_id}/{receipt_id}/original.ext
+{user_id}/{receipt_id}/processed.jpg
 ```
 
-前端上传文件时必须使用该路径格式。Edge Function 使用 service role 读取原始文件并写回解析结果。
+前端上传文件时必须使用该路径格式。原图永远保留在 `original.ext`，上传前裁剪/旋转后的识别图保存在 `processed.jpg`。Edge Function 使用 service role 优先读取 `processed_file_path`，没有裁剪图时回退读取原图。
 
 ## 9. 前端部署步骤
 
@@ -132,9 +178,18 @@ dist
 Supabase Function secrets 单独设置，不要复制到前端托管平台：
 
 ```bash
-supabase secrets set OPENAI_API_KEY=...
-supabase secrets set GOOGLE_VISION_KEY=...
-supabase secrets set SUPABASE_SERVICE_ROLE_KEY=...
+supabase secrets set OCR_PROVIDER=tencent
+supabase secrets set TENCENT_SECRET_ID=...
+supabase secrets set TENCENT_SECRET_KEY=...
+supabase secrets set OCR_FREE_MONTHLY_LIMIT=900
+supabase secrets set AI_REPAIR_PROVIDER=deepseek
+supabase secrets set DEEPSEEK_API_KEY=...
+supabase secrets set DEEPSEEK_MODEL=deepseek-v4-flash
+supabase secrets set DEEPSEEK_MONTHLY_LIMIT=500
+supabase secrets set VISION_PROVIDER=qwen
+supabase secrets set DASHSCOPE_API_KEY=...
+supabase secrets set QWEN_VL_MODEL=qwen3.6-plus
+supabase secrets set VISION_MONTHLY_LIMIT=100
 supabase functions deploy parse-receipt
 ```
 
@@ -143,12 +198,12 @@ supabase functions deploy parse-receipt
 - `npm test` 通过。
 - `npm run lint` 通过。
 - `npm run build` 通过。
-- 前端源码、Vite 配置、`.env.example` 不包含 OpenAI、Google Vision、service role 或 Gemini key。
+- 前端源码、Vite 配置、`.env.example` 不包含腾讯云密钥、DeepSeek key、DashScope key、OpenAI、OpenAI 开关、service role 或 Gemini key。
 - `receipts` 和 `receipt_items` 已启用 RLS。
 - `receipts` Storage bucket 为 private。
-- Storage object path 使用 `{user_id}/{receipt_id}/original.ext`。
+- Storage object path 使用 `{user_id}/{receipt_id}/original.ext`，裁剪图使用 `{user_id}/{receipt_id}/processed.jpg`。
 - `parse-receipt` 已部署，并能通过当前用户 JWT 校验 receipt 所有权。
-- 上传一张清晰收据后，状态能从 `uploaded` 进入 `processing`，最后到 `pending_review` 或 `failed`。
+- 上传一张清晰 JPG/PNG 收据后，先出现裁剪弹窗；应用裁剪后状态能从 `uploaded` 进入 `processing`，最后到 `pending_review`，并写入 `raw_ocr`。
 - 审核保存能写回 `receipts` 与 `receipt_items`。
 - Excel 导出能下载 `.xlsx`。
 

@@ -21,6 +21,8 @@ export interface Receipt {
   filename: string
   mime_type: string | null
   file_path: string | null
+  processed_file_path?: string | null
+  image_processing?: Record<string, unknown> | null
   status: ReceiptStatus
   merchant_name: string | null
   company_reg_no: string | null
@@ -58,4 +60,3 @@ export interface ReceiptFilters {
   category?: ReceiptCategory | 'All'
   tag?: ReceiptTag | 'All'
 }
-
