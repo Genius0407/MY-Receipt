@@ -1,0 +1,158 @@
+export const SYSTEM_PROMPT = `You extract structured data from Malaysian receipts and invoices.
+Return strict JSON only. Do not include markdown.
+Use null when a field is not visible.
+Use numbers for amounts and quantities.
+Allowed category values: Grocery, Fuel, F&B, Retail, Service, Other.
+Allowed doc_type values: Receipt, Invoice, Credit Note, Expense.
+Allowed tags: Business, Personal, Tax Deductible, Pending.
+`
+
+const SUBSIDY_SCHEMA = `{
+    "program": string | null,
+    "ref_no": string | null,
+    "pump_price": number | null,
+    "subsidy_price": number | null,
+    "subsidised_litre": number | null,
+    "government_subsidy": number | null,
+    "previous_balance_litre": number | null,
+    "remaining_balance_litre": number | null,
+    "gross_total": number | null,
+    "payable_total": number | null,
+    "notes": string | null
+  } | null`
+
+export function buildUserPrompt(ocrText: string) {
+  return `Extract this receipt into the JSON shape below.
+
+Special rules for Malaysian fuel subsidy receipts:
+- If the receipt shows Shell, BUDI MADANI RON95, subsidy price, government subsidy, or OPT, set category to Fuel.
+- Put the fuel gross amount printed as Subtotal / Grand Total in grand_total and subtotal.
+- Put the amount actually paid by the customer, often labelled OPT or Outstanding Payment Total, in subsidy_details.payable_total.
+- Put the government subsidy amount only in subsidy_details.government_subsidy, not in discount, unless the receipt explicitly labels it as a normal discount.
+- Preserve litre quantities with 3 decimals when visible, for example 32.320 L.
+- For fuel item rows, use unit "L", qty as litres, unit_price as RM/L, and line_total as the fuel gross amount.
+
+{
+  "merchant_name": string | null,
+  "company_reg_no": string | null,
+  "address": string | null,
+  "phone": string | null,
+  "invoice_no": string | null,
+  "date": "YYYY-MM-DD" | null,
+  "time": string | null,
+  "category": "Grocery" | "Fuel" | "F&B" | "Retail" | "Service" | "Other",
+  "doc_type": "Receipt" | "Invoice" | "Credit Note" | "Expense",
+  "subtotal": number,
+  "discount": number,
+  "tax": number,
+  "service_charge": number,
+  "rounding": number,
+  "grand_total": number,
+  "payment_method": string | null,
+  "change": number,
+  "subsidy_details": ${SUBSIDY_SCHEMA},
+  "tags": string[],
+  "confidence_score": number,
+  "items": [
+    {
+      "name": string,
+      "qty": number,
+      "unit": string | null,
+      "unit_price": number,
+      "line_total": number
+    }
+  ]
+}
+
+OCR text:
+${ocrText}`
+}
+
+export function buildImageUserPrompt() {
+  return `Read the attached Malaysian receipt or invoice image and extract it into the JSON shape below.
+Focus on the receipt itself, not the table/background.
+Extract every visible line item, even when the OCR-like text is faint or split across multiple rows.
+For receipts with a printed total, make grand_total match the printed NET TOTAL / GRAND TOTAL / TOTAL amount.
+If item totals do not add up, still return the visible printed items and totals; do not invent missing lines.
+
+Special rules for Malaysian fuel subsidy receipts:
+- If the receipt shows Shell, BUDI MADANI RON95, subsidy price, government subsidy, or OPT, set category to Fuel.
+- Put the fuel gross amount printed as Subtotal / Grand Total in grand_total and subtotal.
+- Put the amount actually paid by the customer, often labelled OPT or Outstanding Payment Total, in subsidy_details.payable_total.
+- Put the government subsidy amount only in subsidy_details.government_subsidy, not in discount, unless the receipt explicitly labels it as a normal discount.
+- Preserve litre quantities with 3 decimals when visible, for example 32.320 L.
+- For fuel item rows, use unit "L", qty as litres, unit_price as RM/L, and line_total as the fuel gross amount.
+- Capture BUDI MADANI fields in subsidy_details: program, ref_no, pump_price, subsidy_price, subsidised_litre, government_subsidy, previous_balance_litre, remaining_balance_litre, gross_total, payable_total.
+
+{
+  "merchant_name": string | null,
+  "company_reg_no": string | null,
+  "address": string | null,
+  "phone": string | null,
+  "invoice_no": string | null,
+  "date": "YYYY-MM-DD" | null,
+  "time": string | null,
+  "category": "Grocery" | "Fuel" | "F&B" | "Retail" | "Service" | "Other",
+  "doc_type": "Receipt" | "Invoice" | "Credit Note" | "Expense",
+  "subtotal": number,
+  "discount": number,
+  "tax": number,
+  "service_charge": number,
+  "rounding": number,
+  "grand_total": number,
+  "payment_method": string | null,
+  "change": number,
+  "subsidy_details": ${SUBSIDY_SCHEMA},
+  "tags": string[],
+  "confidence_score": number,
+  "items": [
+    {
+      "name": string,
+      "qty": number,
+      "unit": string | null,
+      "unit_price": number,
+      "line_total": number
+    }
+  ]
+}`
+}
+
+export function buildTextRepairPrompt(ocrText: string, initialJson: Record<string, unknown>) {
+  return `Repair the structured receipt JSON using the OCR text below.
+
+Rules:
+- Return strict JSON only, using the same shape as the initial JSON.
+- Use the OCR text as the source of truth.
+- Preserve the exact visible language of item names. For Chinese receipts, keep Chinese item names in Chinese.
+- Do not translate, romanize, abbreviate, or guess item names when the OCR text is damaged.
+- Never output placeholder-like item names such as "*", "#", "HEH gkt", "[B](*)", "# tE(", or other symbol-heavy OCR fragments unless that exact text is the only visible item name.
+- Fix obvious OCR errors in Malaysian English receipts, especially merchant, invoice number, date, payment method, totals, rounding, and line items.
+- Preserve visible printed totals such as NET TOTAL, GRAND TOTAL, TOTAL, Sub Total, Rounding Adjustment, and Change.
+- Extract all visible line items. A line item may be split across name, currency marker, and amount lines.
+- For Shell/BUDI MADANI RON95 receipts, keep fuel gross total in grand_total/subtotal, keep OPT or actual customer payment in subsidy_details.payable_total, and keep government subsidy in subsidy_details.government_subsidy.
+- Do not invent items that are not supported by OCR text.
+- If the item name is unreadable, omit that item rather than returning a garbage name. Keep subtotal/grand_total from the printed receipt.
+- If uncertain, keep the value from initial JSON and lower confidence_score.
+
+Initial JSON:
+${JSON.stringify(initialJson, null, 2)}
+
+OCR text:
+${ocrText}`
+}
+
+export function buildVisionPolishPrompt(visionJson: Record<string, unknown>) {
+  return `Review and polish the structured receipt JSON below.
+
+Rules:
+- Return strict JSON only, using the same shape as the input JSON.
+- The JSON came from a vision model that read the receipt image. Treat item names from the vision JSON as the source of truth.
+- Do not translate, romanize, or rewrite item names. Preserve Chinese, English, Malay, abbreviations, and casing as provided.
+- Fix only structural issues: dates, numeric types, subtotal, discount, tax, service charge, rounding, grand_total, change, category, doc_type, tags, and obvious duplicate/empty item rows.
+- Preserve subsidy_details. For Shell/BUDI MADANI RON95 receipts, keep gross fuel total in grand_total/subtotal, keep OPT or customer-paid amount in subsidy_details.payable_total, and keep government subsidy in subsidy_details.government_subsidy.
+- If item totals do not add up to printed totals, keep visible line items and printed totals; do not invent missing items.
+- If uncertain, lower confidence_score and add parser_note.
+
+Vision JSON:
+${JSON.stringify(visionJson, null, 2)}`
+}
