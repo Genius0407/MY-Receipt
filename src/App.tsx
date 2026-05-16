@@ -194,6 +194,13 @@ type SmartCropTarget = {
   file: File;
 };
 
+type DuplicatePromptState = {
+  file: File;
+  previewUrl: string;
+  fileHash: string;
+  candidates: DuplicateCandidate[];
+};
+
 function toDisplayReceipt(receipt: any) {
   const items = receipt.receipt_items || receipt.items || [];
   const category = receipt.category || receipt.industry || 'Other';
@@ -574,7 +581,7 @@ export default function App() {
   const [deletedReceipts, setDeletedReceipts] = useState<any[]>([]);
   const [fieldPreferences, setFieldPreferences] = useState<FieldPreference[]>(() => defaultFieldPreferences());
   const [customDocumentTypes, setCustomDocumentTypes] = useState<string[]>([]);
-  const [duplicatePrompt, setDuplicatePrompt] = useState<{ file: File; previewUrl: string; candidates: DuplicateCandidate[] } | null>(null);
+  const [duplicatePrompt, setDuplicatePrompt] = useState<DuplicatePromptState | null>(null);
   const [selectedDeletedIds, setSelectedDeletedIds] = useState<string[]>([]);
   const [isExporting, setIsExporting] = useState(false);
   const [zoomImage, setZoomImage] = useState<string | null>(null);
@@ -585,6 +592,7 @@ export default function App() {
   const [repairProgress, setRepairProgress] = useState<RepairProgress | null>(null);
   const repairProgressTimerRef = useRef<number | null>(null);
   const pollingReceiptIdsRef = useRef<Set<string>>(new Set());
+  const pendingUploadHashesRef = useRef<Set<string>>(new Set());
   const [selectedRowIds, setSelectedRowIds] = useState<string[]>([]);
   const [toast, setToast] = useState<{message: string, type: 'info' | 'success' | 'error'} | null>(null);
   const [filters, setFilters] = useState({ search: '', status: 'All', docType: 'All', tag: 'All' });
@@ -862,22 +870,34 @@ export default function App() {
 
   const prepareReceiptUpload = async (file: File) => {
     const previewUrl = URL.createObjectURL(file);
+    let reservedHash: string | null = null;
     try {
       const [fileHash, perceptualHash] = await Promise.all([
         computeFileSha256(file),
         computeImageAverageHash(file),
       ]);
+
+      if (pendingUploadHashesRef.current.has(fileHash)) {
+        URL.revokeObjectURL(previewUrl);
+        showToast(`${file.name} is already uploading.`, 'info');
+        return;
+      }
+
+      pendingUploadHashesRef.current.add(fileHash);
+      reservedHash = fileHash;
+
       const candidates = await findDuplicateCandidates({
         fileHash,
         receipt: perceptualHash ? { image_processing: { perceptual_hash: perceptualHash } } : null,
       });
       if (candidates.length > 0) {
-        setDuplicatePrompt({ file, previewUrl, candidates });
+        setDuplicatePrompt({ file, previewUrl, fileHash, candidates });
         return;
       }
       const qrPayload = await decodeQrPayloadFromImageFile(file);
-      await uploadOriginalReceipt(file, previewUrl, qrPayload);
+      await uploadOriginalReceipt(file, previewUrl, qrPayload, fileHash);
     } catch (error) {
+      if (reservedHash) pendingUploadHashesRef.current.delete(reservedHash);
       URL.revokeObjectURL(previewUrl);
       console.error('Duplicate precheck failed:', error);
       showToast(error instanceof Error ? error.message : 'Duplicate precheck failed.', 'error');
@@ -888,26 +908,34 @@ export default function App() {
     const prompt = duplicatePrompt;
     if (!prompt) return;
     setDuplicatePrompt(null);
-    const qrPayload = await decodeQrPayloadFromImageFile(prompt.file);
-    void uploadOriginalReceipt(prompt.file, prompt.previewUrl, qrPayload);
+    try {
+      const qrPayload = await decodeQrPayloadFromImageFile(prompt.file);
+      void uploadOriginalReceipt(prompt.file, prompt.previewUrl, qrPayload, prompt.fileHash);
+    } catch (error) {
+      pendingUploadHashesRef.current.delete(prompt.fileHash);
+      URL.revokeObjectURL(prompt.previewUrl);
+      console.error('QR decode failed:', error);
+      showToast(error instanceof Error ? error.message : 'Upload failed.', 'error');
+    }
   };
 
   const cancelDuplicateUpload = () => {
     if (duplicatePrompt?.previewUrl) URL.revokeObjectURL(duplicatePrompt.previewUrl);
+    if (duplicatePrompt?.fileHash) pendingUploadHashesRef.current.delete(duplicatePrompt.fileHash);
     setDuplicatePrompt(null);
   };
 
   const openDuplicateCandidate = (id: string) => {
     if (duplicatePrompt?.previewUrl) URL.revokeObjectURL(duplicatePrompt.previewUrl);
+    if (duplicatePrompt?.fileHash) pendingUploadHashesRef.current.delete(duplicatePrompt.fileHash);
     setDuplicatePrompt(null);
     const existing = history.find((item) => item.id === id) || deletedReceipts.find((item) => item.id === id);
     if (existing) setSelectedReceipt(existing);
   };
 
-  const uploadOriginalReceipt = async (file: File, existingPreviewUrl?: string, qrPayload?: string | null) => {
+  const uploadOriginalReceipt = async (file: File, existingPreviewUrl?: string, qrPayload?: string | null, fileHash?: string | null) => {
     const uploadId = Math.random().toString(36).substr(2, 9);
     const previewUrl = existingPreviewUrl || URL.createObjectURL(file);
-    const perceptualHash = await computeImageAverageHash(file);
     const uploadItem = {
       id: uploadId,
       name: file.name,
@@ -920,6 +948,7 @@ export default function App() {
     setUploadList((prev) => [uploadItem, ...prev]);
 
     try {
+      const perceptualHash = await computeImageAverageHash(file).catch(() => null);
       const result = await createReceiptFromFile(file, {
         imageProcessing: perceptualHash ? { perceptual_hash: perceptualHash } : null,
         autoParse: true,
@@ -940,6 +969,8 @@ export default function App() {
       setUploadList((old: any[]) => old.map(u => u.id === uploadId ? { ...u, status: 'Failed', progress: 100 } : u));
       showToast(error instanceof Error ? error.message : 'Upload failed.', 'error');
       URL.revokeObjectURL(previewUrl);
+    } finally {
+      if (fileHash) pendingUploadHashesRef.current.delete(fileHash);
     }
   };
 
