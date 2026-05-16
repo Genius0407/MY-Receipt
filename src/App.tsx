@@ -864,14 +864,27 @@ export default function App() {
     }
 
     files.forEach((file) => {
-      void prepareReceiptUpload(file);
+      const uploadId = Math.random().toString(36).slice(2, 11);
+      const previewUrl = URL.createObjectURL(file);
+      setUploadList((prev) => [{
+        id: uploadId,
+        name: file.name,
+        status: 'Preparing upload',
+        progress: 8,
+        image_url: previewUrl,
+        file,
+      }, ...prev]);
+      void prepareReceiptUpload(file, uploadId, previewUrl);
     });
   };
 
-  const prepareReceiptUpload = async (file: File) => {
-    const previewUrl = URL.createObjectURL(file);
+  const prepareReceiptUpload = async (file: File, uploadId: string, previewUrl: string) => {
     let reservedHash: string | null = null;
     try {
+      setUploadList((old: any[]) => old.map((item) => item.id === uploadId
+        ? { ...item, progress: 14, status: 'Checking duplicate file' }
+        : item));
+
       const [fileHash, perceptualHash] = await Promise.all([
         computeFileSha256(file),
         computeImageAverageHash(file),
@@ -879,6 +892,7 @@ export default function App() {
 
       if (pendingUploadHashesRef.current.has(fileHash)) {
         URL.revokeObjectURL(previewUrl);
+        setUploadList((old: any[]) => old.filter((item) => item.id !== uploadId));
         showToast(`${file.name} is already uploading.`, 'info');
         return;
       }
@@ -891,14 +905,19 @@ export default function App() {
         receipt: perceptualHash ? { image_processing: { perceptual_hash: perceptualHash } } : null,
       });
       if (candidates.length > 0) {
+        setUploadList((old: any[]) => old.filter((item) => item.id !== uploadId));
         setDuplicatePrompt({ file, previewUrl, fileHash, candidates });
         return;
       }
+      setUploadList((old: any[]) => old.map((item) => item.id === uploadId
+        ? { ...item, progress: 18, status: 'Reading QR and metadata' }
+        : item));
       const qrPayload = await decodeQrPayloadFromImageFile(file);
-      await uploadOriginalReceipt(file, previewUrl, qrPayload, fileHash);
+      await uploadOriginalReceipt(file, previewUrl, qrPayload, fileHash, uploadId);
     } catch (error) {
       if (reservedHash) pendingUploadHashesRef.current.delete(reservedHash);
       URL.revokeObjectURL(previewUrl);
+      setUploadList((old: any[]) => old.map((item) => item.id === uploadId ? { ...item, status: 'Failed', progress: 100 } : item));
       console.error('Duplicate precheck failed:', error);
       showToast(error instanceof Error ? error.message : 'Duplicate precheck failed.', 'error');
     }
@@ -933,19 +952,23 @@ export default function App() {
     if (existing) setSelectedReceipt(existing);
   };
 
-  const uploadOriginalReceipt = async (file: File, existingPreviewUrl?: string, qrPayload?: string | null, fileHash?: string | null) => {
-    const uploadId = Math.random().toString(36).substr(2, 9);
+  const uploadOriginalReceipt = async (file: File, existingPreviewUrl?: string, qrPayload?: string | null, fileHash?: string | null, existingUploadId?: string) => {
+    const uploadId = existingUploadId || Math.random().toString(36).slice(2, 11);
     const previewUrl = existingPreviewUrl || URL.createObjectURL(file);
-    const uploadItem = {
-      id: uploadId,
-      name: file.name,
-      status: 'Uploading original receipt',
-      progress: 20,
-      image_url: previewUrl,
-      file,
-    };
-
-    setUploadList((prev) => [uploadItem, ...prev]);
+    if (existingUploadId) {
+      setUploadList((old: any[]) => old.map((item) => item.id === uploadId
+        ? { ...item, status: 'Uploading original receipt', progress: 20 }
+        : item));
+    } else {
+      setUploadList((prev) => [{
+        id: uploadId,
+        name: file.name,
+        status: 'Uploading original receipt',
+        progress: 20,
+        image_url: previewUrl,
+        file,
+      }, ...prev]);
+    }
 
     try {
       const perceptualHash = await computeImageAverageHash(file).catch(() => null);
