@@ -2,10 +2,7 @@
 
 马来西亚英文收据智能识别与管理系统。
 
-当前仓库包含两部分：
-
-- 远程仓库已有的 React/Vite 前端原型。
-- 新增的 Supabase 架构文档、数据库 schema、Edge Function 开发计划。
+当前仓库是 React/Vite 静态前端 + Supabase 后端资源的生产化工程。
 
 ## 架构目标
 
@@ -19,7 +16,7 @@
 
 ## 本地运行
 
-前端原型来自 AI Studio，当前可按远程项目方式运行：
+本地开发：
 
 ```bash
 npm install

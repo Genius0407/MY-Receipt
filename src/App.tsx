@@ -1358,7 +1358,7 @@ export default function App() {
                  <div className="bg-white border border-slate-200 rounded-[24px] overflow-hidden shadow-sm">
                     <table className="w-full text-left">
                        <thead className="bg-slate-50 text-[10px] font-black text-slate-500 uppercase border-b border-slate-100">
-                          <tr><th className="px-6 py-4">已同步数据 (Google Sheets)</th><th className="px-6 py-4">Total</th><th className="px-6 py-4 text-right">Action</th></tr>
+                          <tr><th className="px-6 py-4">已同步数据 (Supabase)</th><th className="px-6 py-4">Total</th><th className="px-6 py-4 text-right">Action</th></tr>
                        </thead>
                        <tbody className="divide-y divide-slate-50">
                           {filteredHistory.filter(h => h.status === 'Synced').map(item => (

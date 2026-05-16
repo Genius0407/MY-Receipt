@@ -63,7 +63,7 @@ src/
     receipt.ts
 ```
 
-`index (2).html` 目前作为 UI 参考稿，不作为生产入口。正式开发时建议迁移为 React + Vite + Tailwind 工程。
+生产入口是 React + Vite 应用。早期 AI Studio HTML 参考稿已从主线移除，后续 UI 迭代直接在组件内完成。
 
 ## 5. 数据状态
 

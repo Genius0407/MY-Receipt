@@ -214,7 +214,7 @@ const { data: { publicUrl } } = supabase.storage
 |----------|---------|------|
 | `VITE_SUPABASE_URL` | 前端 | Supabase 项目 URL |
 | `VITE_SUPABASE_ANON_KEY` | 前端 | 匿名 Key (可公开) |
-| `GEMINI_API_KEY` | 前端 - 原型 | Gemini API Key（生产移除） |
+| `GEMINI_API_KEY` | 不使用 | 生产路径已移除前端 Gemini 调用 |
 | `OPENAI_API_KEY` | Edge Function | OpenAI API Key |
 | `GOOGLE_VISION_KEY` | Edge Function | Google Vision API Key |
 | `SUPABASE_SERVICE_ROLE_KEY` | Edge Function | Supabase 服务角色密钥 |

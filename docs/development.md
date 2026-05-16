@@ -53,7 +53,7 @@ MY-Receipt/
 │   ├── index.css                  # 全局样式 + Tailwind CSS 入口
 │   ├── lib/
 │   │   ├── supabase.ts            # Supabase 客户端单例
-│   │   └── export.ts              # SheetJS Excel 导出工具
+│   │   └── exportExcel.ts         # ExcelJS 导出工具
 │   └── services/
 │       └── geminiService.ts       # Google Gemini API 封装（原型阶段）
 │
