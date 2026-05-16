@@ -26,10 +26,10 @@ parse-receipt/
 
 ```text
 {user_id}/{receipt_id}/original.ext
-{user_id}/{receipt_id}/processed.jpg
+{user_id}/{receipt_id}/processed-{timestamp}.ext
 ```
 
-`processed.jpg` 是用户在解析前裁剪/旋转后的识别输入；原图用于人工核对和审计。
+`processed-{timestamp}.ext` 是用户在解析前裁剪/旋转后的识别输入；每次智能解析保留独立路径，原图用于人工核对和审计。
 
 腾讯云 OCR 模式需要：
 

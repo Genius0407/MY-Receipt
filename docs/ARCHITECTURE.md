@@ -1,4 +1,4 @@
-# 马来西亚英文收据智能识别系统架构说明
+# ResitAI 马来西亚收据审核系统架构说明
 
 ## 1. 当前目标
 
@@ -19,7 +19,7 @@
 
 | 层 | 职责 | 可见密钥 |
 | --- | --- | --- |
-| 静态前端 | 上传、裁剪/旋转、列表、详情校对、标签、筛选、Excel 导出 | `VITE_SUPABASE_URL`、`VITE_SUPABASE_ANON_KEY` |
+| 静态前端 | 批量上传、解析前裁剪/旋转、列表、详情校对、标签、筛选、Excel 导出 | `VITE_SUPABASE_URL`、`VITE_SUPABASE_ANON_KEY` |
 | Supabase Auth | 用户登录、会话、`auth.uid()` | 无 |
 | Supabase Storage | 保存原始收据图片和裁剪后的识别图 | 无 |
 | Supabase Edge Function | OCR、字段抽取、服务端校验、写入数据库 | `TENCENT_SECRET_ID`、`TENCENT_SECRET_KEY`、可选 `OPENAI_API_KEY`、内置 `SUPABASE_SERVICE_ROLE_KEY` |
@@ -28,18 +28,20 @@
 ## 3. 处理流程
 
 1. 用户登录前端。
-2. 前端让用户裁剪/旋转票据区域。
-3. 前端把原图上传到 `receipts/{user_id}/{receipt_id}/original.ext`，把裁剪图上传到 `receipts/{user_id}/{receipt_id}/processed.jpg`。
-4. 前端创建 `receipts` 记录，状态为 `uploaded`，并保存 `processed_file_path` 与 `image_processing`。
-5. 前端调用 Supabase Edge Function `parse-receipt`，传入 `receipt_id`。
-6. Edge Function 校验用户 JWT，并确认该 `receipt_id` 属于当前用户。
-7. Edge Function 优先从 Storage 读取 `processed_file_path`，没有裁剪图时读取原图。
-8. Edge Function 通过 `consume_ocr_quota` 扣减腾讯云 OCR 月度额度，额度内调用 `GeneralBasicOCR`。
-9. Edge Function 用 OCR 文本规则抽取字段；后续可接视觉大模型做高精度重解析。
-10. Edge Function 规范化金额、日期、枚举字段，写入 `receipts` 与 `receipt_items`。
-11. 前端通过 Supabase 查询结果，进入待校对状态。
-12. 用户编辑字段、标签、明细后保存，状态改为 `pending_review` 或 `synced`。
-13. 导出时前端从 Supabase 查询当前筛选结果，用 ExcelJS 生成 `.xlsx`。
+2. 前端批量上传原图到 `receipts/{user_id}/{receipt_id}/original.ext`。
+3. 前端创建 `receipts` 记录，状态为 `uploaded`，并立即在列表展示待解析卡片。
+4. 用户打开单据编辑页，点击“智能解析”。
+5. 前端弹出裁剪/旋转框；用户可裁剪后解析，也可直接解析原图。
+6. 如用户裁剪，前端上传 `receipts/{user_id}/{receipt_id}/processed-{timestamp}.ext`，并保存 `processed_file_path` 与 `image_processing`。
+7. 前端调用 Supabase Edge Function `parse-receipt`，传入 `receipt_id` 与 `mode=smart`。
+8. Edge Function 校验用户 JWT，并确认该 `receipt_id` 属于当前用户。
+9. Edge Function 优先从 Storage 读取 `processed_file_path`，没有裁剪图时读取原图。
+10. `mode=smart` 使用 Qwen VL 读取图片，再用 DeepSeek 校验结构、字段和金额。
+11. Edge Function 规范化金额、日期、枚举字段，写入 `receipts`、`receipt_items`、`processing_stage`、`warnings` 与 duplicate 信息。
+12. 前端刷新结果，进入待校对状态，并展示 processing panel 与 warning panel。
+13. 用户编辑字段、标签、明细后保存，状态改为 `pending_review` 或 `synced`。
+14. 删除默认进入 rejected receipts，恢复或永久删除由用户明确选择。
+15. 导出时前端从 Supabase 查询当前筛选结果，用 ExcelJS 生成 `.xlsx`；`Receipts` 一张发票一行，`Items` 一条明细一行。
 
 ## 4. 推荐前端模块
 
@@ -51,6 +53,12 @@ src/
     UploadDropzone.tsx
     ReceiptTable.tsx
     ReceiptDetailPanel.tsx
+    ProcessingPanel.tsx
+    WarningPanel.tsx
+    DeletedReceiptList.tsx
+    DuplicateDialog.tsx
+    FieldConfigPanel.tsx
+    CustomDocTypeInput.tsx
     TagSelector.tsx
     ExportToolbar.tsx
   lib/
@@ -59,8 +67,15 @@ src/
     receiptApi.ts
     exportExcel.ts
     normalizeReceipt.ts
+    warningRules.ts
+    duplicateDetection.ts
+    fieldConfig.ts
+    documentTypes.ts
   types/
     receipt.ts
+    warning.ts
+    fieldConfig.ts
+    documentType.ts
 ```
 
 生产入口是 React + Vite 应用。早期 AI Studio HTML 参考稿已从主线移除，后续 UI 迭代直接在组件内完成。
@@ -75,6 +90,17 @@ src/
 | `synced` | 已确认保存，可作为正式台账记录 |
 | `failed` | OCR/AI 失败，可重试 |
 
+处理阶段由 `processing_stage` 细分：
+
+| 阶段 | 含义 |
+| --- | --- |
+| `uploaded` | 文件已入库 |
+| `ocr_scanning` | OCR 或视觉读取中 |
+| `ai_extracting` | AI 结构化字段抽取中 |
+| `generating_preview` | 正在整理可审核结果 |
+| `ready_for_review` | 可人工审核 |
+| `ocr_failed` | OCR/AI 失败 |
+
 ## 6. 字段模型约定
 
 统一使用以下字段，避免旧 demo 中 `industry/tax_sst/subsidy_info` 与 Worker 中 `category/tax/subsidy_details` 混用。
@@ -82,12 +108,19 @@ src/
 | 标准字段 | 说明 |
 | --- | --- |
 | `category` | 行业分类：`Grocery`、`Fuel`、`F&B`、`Retail`、`Service`、`Other` |
-| `doc_type` | 单据类型：`Receipt`、`Invoice`、`Credit Note`、`Expense` |
+| `doc_type` | 单据类型：`Receipt`、`Invoice`、`Credit Note`、`Expense`、`E-invoice` |
+| `custom_doc_type` | 自定义单据类型标签 |
 | `tax` | 税额，包含 SST 等税项 |
 | `subsidy_details` | 补贴信息，使用 JSON |
+| `extra_fields` | E-invoice 或专属票据扩展字段 |
+| `warnings` | warning panel 使用的结构化异常数组 |
+| `deleted_at/deleted_reason/deleted_note` | rejected receipts / soft delete |
+| `file_hash/duplicate_of/duplicate_score` | duplicate detection |
 | `tags` | 用户标签数组 |
-| `processed_file_path` | 裁剪/旋转后的识别图路径 |
-| `image_processing` | 上传前裁剪参数与输出尺寸 |
+| `processed_file_path` | 解析前裁剪/旋转后的识别图路径 |
+| `image_processing` | 解析前裁剪参数与输出尺寸 |
+
+不同票据类型的字段展示策略见 [RECEIPT_FIELD_DISPLAY_STRATEGY.md](./RECEIPT_FIELD_DISPLAY_STRATEGY.md)。
 
 ## 7. 不再采用的方案
 

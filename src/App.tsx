@@ -1,26 +1,46 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { 
-  Upload, FileText, Search, Filter, Download, CheckCircle, Clock, AlertCircle, 
-  Loader2, MoreHorizontal, Settings, Plus, X, ChevronRight, Database, Trash2, 
-  ExternalLink, ChevronDown, Eye, CreditCard, Building2, Receipt, Save, RefreshCw,
-  Info, ShieldCheck, Landmark, Globe, Palette, Layout, ShoppingCart, Calculator,
-  Tag, AlertTriangle, FileSpreadsheet, Cpu, RefreshCcw, FileOutput, ZoomIn, Cloud,
-  Languages, Sun, Moon, Banknote
+import {
+  Upload, Search, CheckCircle, AlertCircle, X, Trash2,
+  ExternalLink, ChevronDown, Info, FileSpreadsheet, LogOut
 } from 'lucide-react';
 import {
   createReceiptFileSignedUrl,
   createReceiptFromFile,
-  deleteReceipt,
+  findDuplicateCandidates,
+  listCustomDocumentTypes,
+  listDeletedReceipts,
+  listFieldPreferences,
   listReceipts,
+  permanentlyDeleteReceipt,
   pollReceiptUntilParsed,
+  restoreReceipt,
   saveReceipt,
+  saveCustomDocumentType,
+  saveFieldPreferences,
+  softDeleteReceipt,
   smartParseReceipt,
   uploadProcessedReceiptImage,
   validateReceiptFile,
 } from './lib/receiptApi';
+import { computeFileSha256, computeImageAverageHash } from './lib/duplicateDetection';
+import { evaluateReceiptWarnings } from './lib/warningRules';
+import { defaultFieldPreferences, isFieldEnabled, mergeFieldPreferences } from './lib/fieldConfig';
+import { decodeQrPayloadFromImageFile, looksLikeEInvoiceQrPayload } from './lib/qrPayload';
 import { downloadReceiptsXlsx } from './lib/exportExcel';
+import { formatSubsidyHeadline } from './lib/subsidyDetails';
+import { DeletedReceiptList } from './components/DeletedReceiptList';
+import { DuplicateDialog } from './components/DuplicateDialog';
 import { ReceiptCropModal } from './components/ReceiptCropModal';
+import { ReceiptTable } from './components/ReceiptTable';
+import { UploadQueue } from './components/UploadQueue';
+import { Sidebar } from './components/Sidebar';
+import { AppShell } from './components/AppShell';
+import { SettingsModal } from './components/SettingsModal';
+import { ReceiptReviewDrawer } from './components/ReceiptReviewDrawer';
 import type { ImageProcessingMetadata } from './lib/imagePreprocess';
+import type { DuplicateCandidate } from './types/duplicate';
+import type { FieldKey, FieldPreference } from './types/fieldConfig';
+import { supabase } from './lib/supabaseClient';
 
 // 初始模拟数据：完全覆盖 PRD V1.1 的所有字段与要求状态
 const INITIAL_HISTORY = [
@@ -135,7 +155,7 @@ const INITIAL_HISTORY = [
 ];
 
 const INDUSTRIES = ['Grocery', 'Fuel', 'F&B', 'Retail', 'Service', 'Other', 'Custom (自定义)'];
-const DOC_TYPES = ['Receipt', 'Invoice', 'Credit Note', 'Expense', 'Custom (自定义)'];
+const DOC_TYPES = ['Receipt', 'Invoice', 'Credit Note', 'Expense', 'E-invoice', 'Custom (自定义)'];
 const TAGS_OPTIONS = ['Business', 'Personal', 'Tax Deductible', 'Pending']; 
 
 const THEMES = [
@@ -174,54 +194,6 @@ type SmartCropTarget = {
   file: File;
 };
 
-type SubsidyDetails = Record<string, unknown> | null | undefined;
-
-function asSubsidyObject(details: SubsidyDetails) {
-  return details && typeof details === 'object' ? details : null;
-}
-
-function readSubsidyText(details: SubsidyDetails, keys: string[]) {
-  const object = asSubsidyObject(details);
-  if (!object) return '';
-  for (const key of keys) {
-    const value = object[key];
-    if (typeof value === 'string' && value.trim()) return value.trim();
-  }
-  return '';
-}
-
-function readSubsidyNumber(details: SubsidyDetails, keys: string[]) {
-  const object = asSubsidyObject(details);
-  if (!object) return null;
-  for (const key of keys) {
-    const value = object[key];
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
-    if (typeof value === 'string' && value.trim() !== '') {
-      const parsed = Number(value.replace(/[^\d.-]/g, ''));
-      if (Number.isFinite(parsed)) return parsed;
-    }
-  }
-  return null;
-}
-
-function hasSubsidyDetails(details: SubsidyDetails) {
-  const object = asSubsidyObject(details);
-  if (!object) return false;
-  return Object.values(object).some((value) => value !== null && value !== undefined && String(value).trim() !== '');
-}
-
-function formatSubsidyHeadline(details: SubsidyDetails) {
-  const program = readSubsidyText(details, ['program', 'scheme', 'name']);
-  const description = readSubsidyText(details, ['description', 'notes', 'note']);
-  const governmentSubsidy = readSubsidyNumber(details, ['government_subsidy', 'subsidy_amount']);
-  const payableTotal = readSubsidyNumber(details, ['payable_total', 'paid_total', 'opt', 'outstanding_payment_total']);
-
-  if (program && governmentSubsidy !== null && payableTotal !== null) {
-    return `${program}: subsidy RM ${governmentSubsidy.toFixed(2)}, payable RM ${payableTotal.toFixed(2)}`;
-  }
-  return program || description || '';
-}
-
 function toDisplayReceipt(receipt: any) {
   const items = receipt.receipt_items || receipt.items || [];
   const category = receipt.category || receipt.industry || 'Other';
@@ -236,6 +208,7 @@ function toDisplayReceipt(receipt: any) {
     tax,
     tax_sst: tax,
     subsidy_info: subsidyInfo,
+    warnings: receipt.warnings || evaluateReceiptWarnings({ ...receipt, receipt_items: items }),
     items: items.map((item: any) => ({
       ...item,
       unit_price: Number(item.unit_price || 0),
@@ -569,13 +542,42 @@ const I18N: any = {
   }
 };
 
+async function copyTextToClipboard(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const textArea = document.createElement('textarea');
+  textArea.value = value;
+  textArea.setAttribute('readonly', '');
+  textArea.style.position = 'fixed';
+  textArea.style.left = '-9999px';
+  textArea.style.opacity = '0';
+  document.body.appendChild(textArea);
+  textArea.select();
+
+  try {
+    if (!document.execCommand('copy')) {
+      throw new Error('Copy command was rejected.');
+    }
+  } finally {
+    document.body.removeChild(textArea);
+  }
+}
+
 export default function App() {
   const [history, setHistory] = useState<any[]>(INITIAL_HISTORY);
-  const [activeTab, setActiveTab] = useState<'upload' | 'history'>('upload');
+  const [activeTab, setActiveTab] = useState<'upload' | 'history' | 'rejected'>('upload');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [selectedReceipt, setSelectedReceipt] = useState<any>(null);
+  const [deletedReceipts, setDeletedReceipts] = useState<any[]>([]);
+  const [fieldPreferences, setFieldPreferences] = useState<FieldPreference[]>(() => defaultFieldPreferences());
+  const [customDocumentTypes, setCustomDocumentTypes] = useState<string[]>([]);
+  const [duplicatePrompt, setDuplicatePrompt] = useState<{ file: File; previewUrl: string; candidates: DuplicateCandidate[] } | null>(null);
+  const [selectedDeletedIds, setSelectedDeletedIds] = useState<string[]>([]);
+  const [isExporting, setIsExporting] = useState(false);
   const [zoomImage, setZoomImage] = useState<string | null>(null);
-  const [imagePreviewMode, setImagePreviewMode] = useState<'processed' | 'original'>('processed');
   const [uploadList, setUploadList] = useState<any[]>([]);
   const [smartCropTarget, setSmartCropTarget] = useState<SmartCropTarget | null>(null);
   const [isCropModalBusy, setIsCropModalBusy] = useState(false);
@@ -583,7 +585,6 @@ export default function App() {
   const [repairProgress, setRepairProgress] = useState<RepairProgress | null>(null);
   const repairProgressTimerRef = useRef<number | null>(null);
   const pollingReceiptIdsRef = useRef<Set<string>>(new Set());
-  const [newTagInput, setNewTagInput] = useState("");
   const [selectedRowIds, setSelectedRowIds] = useState<string[]>([]);
   const [toast, setToast] = useState<{message: string, type: 'info' | 'success' | 'error'} | null>(null);
   const [filters, setFilters] = useState({ search: '', status: 'All', docType: 'All', tag: 'All' });
@@ -623,7 +624,17 @@ export default function App() {
     return I18N[langKey];
   }, [config.language]);
 
+  const documentTypeOptions = useMemo(() => {
+    const customOptions = customDocumentTypes.filter((name) => !DOC_TYPES.includes(name));
+    return [...DOC_TYPES, ...customOptions];
+  }, [customDocumentTypes]);
+
   const isSelectableForBulk = (receipt: any) => receipt.status === 'Pending' || receipt.status === 'Failed';
+  const isAuditFieldVisible = (fieldKey: FieldKey) => isFieldEnabled(fieldPreferences, fieldKey);
+  const enabledFieldKeys = useMemo(
+    () => fieldPreferences.filter((preference) => preference.enabled).map((preference) => preference.field_key),
+    [fieldPreferences],
+  );
 
   const syncToDatabase = async (data: any) => {
     try {
@@ -699,11 +710,23 @@ export default function App() {
   };
 
   useEffect(() => {
+    let refreshTimer: number | null = null;
+    let realtimeChannel: ReturnType<NonNullable<typeof supabase>['channel']> | null = null;
+
     const loadData = async () => {
       try {
-        const data = await listReceipts();
+        const [data, deletedData, preferences, documentTypes] = await Promise.all([
+          listReceipts(),
+          listDeletedReceipts(),
+          listFieldPreferences().catch(() => defaultFieldPreferences()),
+          listCustomDocumentTypes().catch(() => []),
+        ]);
         const displayData = await Promise.all(data.map((receipt) => buildDisplayReceipt(receipt)));
+        const deletedDisplayData = await Promise.all(deletedData.map((receipt) => buildDisplayReceipt(receipt)));
         setHistory(displayData);
+        setDeletedReceipts(deletedDisplayData);
+        setFieldPreferences(mergeFieldPreferences(preferences));
+        setCustomDocumentTypes(documentTypes.map((item: any) => item.name));
         data
           .filter((receipt) => receipt.status === 'processing')
           .forEach((receipt) => startReceiptResultPolling(receipt.id));
@@ -713,6 +736,32 @@ export default function App() {
       }
     };
     loadData();
+
+    if (supabase) {
+      void supabase.auth.getUser().then(({ data }) => {
+        if (!data.user || !supabase) return;
+        realtimeChannel = supabase
+          .channel(`receipts-${data.user.id}`)
+          .on(
+            'postgres_changes',
+            { event: '*', schema: 'public', table: 'receipts', filter: `user_id=eq.${data.user.id}` },
+            () => {
+              if (refreshTimer) window.clearTimeout(refreshTimer);
+              refreshTimer = window.setTimeout(() => {
+                void loadData();
+              }, 600);
+            },
+          )
+          .subscribe();
+      });
+    }
+
+    return () => {
+      if (refreshTimer) window.clearTimeout(refreshTimer);
+      if (supabase && realtimeChannel) {
+        void supabase.removeChannel(realtimeChannel);
+      }
+    };
   }, []);
 
   const handleToggleSelectAll = () => {
@@ -735,8 +784,11 @@ export default function App() {
 
   const filteredHistory = useMemo(() => {
     return history.filter(item => {
-      const matchSearch = item.merchant_name?.toLowerCase().includes(filters.search.toLowerCase()) || 
-                          item.invoice_no?.toLowerCase().includes(filters.search.toLowerCase());
+      const search = filters.search.trim().toLowerCase();
+      const matchSearch = !search
+        || item.merchant_name?.toLowerCase().includes(search)
+        || item.invoice_no?.toLowerCase().includes(search)
+        || item.filename?.toLowerCase().includes(search);
       const matchStatus = filters.status === 'All' || item.status === filters.status;
       const matchType = filters.docType === 'All' || item.doc_type === filters.docType;
       const matchTag = filters.tag === 'All' || item.tags?.includes(filters.tag);
@@ -744,116 +796,8 @@ export default function App() {
     });
   }, [history, filters]);
 
-  const updateItem = (itemId: string, field: string, value: any) => {
-    setSelectedReceipt((prev: any) => {
-      if (!prev) return prev;
-      const newItems = (prev.items || []).map((item: any) => {
-        if (item.id === itemId) {
-          const updated = { ...item, [field]: value };
-          if (field === 'qty' || field === 'unit_price') {
-            const qty = parseFloat(updated.qty) || 0;
-            const price = parseFloat(updated.unit_price) || 0;
-            updated.line_total = qty * price;
-          }
-          return updated;
-        }
-        return item;
-      });
-      return { ...prev, items: newItems };
-    });
-  };
-
-  const addNewItem = (e?: React.MouseEvent) => {
-    if(e) e.preventDefault();
-    setSelectedReceipt((prev: any) => {
-      if (!prev) return prev;
-      const newItem = { id: Math.random().toString(36).substr(2, 9), name: '', qty: 1, unit_price: '', line_total: 0 };
-      return { ...prev, items: [...(prev.items || []), newItem] };
-    });
-  };
-
-  const removeItem = (itemId: string) => {
-    setSelectedReceipt((prev: any) => {
-      if (!prev) return prev;
-      return { ...prev, items: (prev.items || []).filter((i: any) => i.id !== itemId) };
-    });
-  };
-
-  const toggleTag = (tag: string) => {
-    if (!selectedReceipt) return;
-    const currentTags = selectedReceipt.tags || [];
-    const newTags = currentTags.includes(tag) 
-      ? currentTags.filter((t: string) => t !== tag)
-      : [...currentTags, tag];
-    setSelectedReceipt({ ...selectedReceipt, tags: newTags });
-  };
-
-  const handleAddCustomTag = (e?: React.MouseEvent | React.KeyboardEvent) => {
-    if (e) e.preventDefault();
-    if (!newTagInput.trim() || !selectedReceipt) return;
-    const currentTags = selectedReceipt.tags || [];
-    if (!currentTags.includes(newTagInput.trim())) {
-      setSelectedReceipt({
-        ...selectedReceipt,
-        tags: [...currentTags, newTagInput.trim()]
-      });
-    }
-    setNewTagInput("");
-  };
-
-  const itemsTotal = useMemo(() => {
-    return selectedReceipt?.items?.reduce((sum: number, item: any) => sum + (item.line_total || 0), 0) || 0;
-  }, [selectedReceipt]);
-
-  const manualTotal = useMemo(() => {
-    if (!selectedReceipt) return 0;
-    return itemsTotal 
-      - (parseFloat(selectedReceipt.discount) || 0) 
-      + (parseFloat(selectedReceipt.tax_sst) || 0) 
-      + (parseFloat(selectedReceipt.service_charge) || 0) 
-      + (parseFloat(selectedReceipt.rounding) || 0);
-  }, [selectedReceipt, itemsTotal]);
-
-  const selectedSubsidyDetails = useMemo(() => {
-    return asSubsidyObject(selectedReceipt?.subsidy_details);
-  }, [selectedReceipt]);
-
-  const selectedSubsidyPayable = useMemo(() => {
-    return readSubsidyNumber(selectedSubsidyDetails, ['payable_total', 'paid_total', 'opt', 'outstanding_payment_total']);
-  }, [selectedSubsidyDetails]);
-
-  const selectedSubsidyRows = useMemo(() => {
-    if (!selectedSubsidyDetails) return [];
-    const money = (value: number | null) => value === null ? '' : `${config.currency} ${value.toFixed(2)}`;
-    const litres = (value: number | null) => value === null ? '' : `${value.toFixed(3)} L`;
-    const rows = [
-      { label: '计划', value: readSubsidyText(selectedSubsidyDetails, ['program', 'scheme', 'name']) },
-      { label: '参考号', value: readSubsidyText(selectedSubsidyDetails, ['ref_no', 'reference_no']) },
-      { label: '原价', value: money(readSubsidyNumber(selectedSubsidyDetails, ['pump_price'])) },
-      { label: '补贴价', value: money(readSubsidyNumber(selectedSubsidyDetails, ['subsidy_price'])) },
-      { label: '补贴升数', value: litres(readSubsidyNumber(selectedSubsidyDetails, ['subsidised_litre', 'subsidized_litre', 'litres'])) },
-      { label: '政府补贴', value: money(readSubsidyNumber(selectedSubsidyDetails, ['government_subsidy', 'subsidy_amount'])) },
-      { label: '实付/OPT', value: money(selectedSubsidyPayable) },
-      { label: '补贴前余额', value: litres(readSubsidyNumber(selectedSubsidyDetails, ['previous_balance_litre', 'previous_balance'])) },
-      { label: '补贴后余额', value: litres(readSubsidyNumber(selectedSubsidyDetails, ['remaining_balance_litre', 'remaining_balance'])) },
-    ];
-    return rows.filter((row) => row.value);
-  }, [config.currency, selectedSubsidyDetails, selectedSubsidyPayable]);
-
-  useEffect(() => {
-    if (!selectedReceipt) return;
-    setImagePreviewMode(selectedReceipt.processed_image_url ? 'processed' : 'original');
-  }, [selectedReceipt?.id]);
-
-  const selectedReceiptImageUrl = useMemo(() => {
-    if (!selectedReceipt) return null;
-    if (imagePreviewMode === 'original') {
-      return selectedReceipt.original_image_url || selectedReceipt.image_url || null;
-    }
-    return selectedReceipt.processed_image_url || selectedReceipt.image_url || selectedReceipt.original_image_url || null;
-  }, [imagePreviewMode, selectedReceipt]);
-
   const handleExport = async (singleItem: any = null) => {
+    if (isExporting) return;
     let dataToExport = [];
     if (singleItem) {
        dataToExport = [singleItem]; 
@@ -868,10 +812,36 @@ export default function App() {
        return;
     }
 
-    await downloadReceiptsXlsx(dataToExport.map(toApiReceipt));
+    setIsExporting(true);
+    try {
+      await downloadReceiptsXlsx(dataToExport.map(toApiReceipt), undefined, { fieldPreferences });
+      showToast(`Successfully Exported ${dataToExport.length} Records!`, 'success');
+      setSelectedRowIds([]);
+    } catch (error) {
+      console.error('Export failed:', error);
+      showToast('Export failed.', 'error');
+    } finally {
+      setIsExporting(false);
+    }
+  };
 
-    showToast(`Successfully Exported ${dataToExport.length} Records!`, 'success');
-    setSelectedRowIds([]);
+  const handleCopyText = async (value: string | null | undefined, label: string, event?: React.MouseEvent) => {
+    event?.stopPropagation();
+    if (!value) {
+      showToast(`${label} is empty.`, 'info');
+      return;
+    }
+    try {
+      await copyTextToClipboard(value);
+      showToast(`${label} copied.`, 'success');
+    } catch (error) {
+      console.error('Copy failed:', error);
+      showToast(`Failed to copy ${label}.`, 'error');
+    }
+  };
+
+  const handleSignOut = async () => {
+    await supabase?.auth.signOut();
   };
 
   const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -886,13 +856,58 @@ export default function App() {
     }
 
     files.forEach((file) => {
-      void uploadOriginalReceipt(file);
+      void prepareReceiptUpload(file);
     });
   };
 
-  const uploadOriginalReceipt = async (file: File) => {
-    const uploadId = Math.random().toString(36).substr(2, 9);
+  const prepareReceiptUpload = async (file: File) => {
     const previewUrl = URL.createObjectURL(file);
+    try {
+      const [fileHash, perceptualHash] = await Promise.all([
+        computeFileSha256(file),
+        computeImageAverageHash(file),
+      ]);
+      const candidates = await findDuplicateCandidates({
+        fileHash,
+        receipt: perceptualHash ? { image_processing: { perceptual_hash: perceptualHash } } : null,
+      });
+      if (candidates.length > 0) {
+        setDuplicatePrompt({ file, previewUrl, candidates });
+        return;
+      }
+      const qrPayload = await decodeQrPayloadFromImageFile(file);
+      await uploadOriginalReceipt(file, previewUrl, qrPayload);
+    } catch (error) {
+      URL.revokeObjectURL(previewUrl);
+      console.error('Duplicate precheck failed:', error);
+      showToast(error instanceof Error ? error.message : 'Duplicate precheck failed.', 'error');
+    }
+  };
+
+  const continueDuplicateUpload = async () => {
+    const prompt = duplicatePrompt;
+    if (!prompt) return;
+    setDuplicatePrompt(null);
+    const qrPayload = await decodeQrPayloadFromImageFile(prompt.file);
+    void uploadOriginalReceipt(prompt.file, prompt.previewUrl, qrPayload);
+  };
+
+  const cancelDuplicateUpload = () => {
+    if (duplicatePrompt?.previewUrl) URL.revokeObjectURL(duplicatePrompt.previewUrl);
+    setDuplicatePrompt(null);
+  };
+
+  const openDuplicateCandidate = (id: string) => {
+    if (duplicatePrompt?.previewUrl) URL.revokeObjectURL(duplicatePrompt.previewUrl);
+    setDuplicatePrompt(null);
+    const existing = history.find((item) => item.id === id) || deletedReceipts.find((item) => item.id === id);
+    if (existing) setSelectedReceipt(existing);
+  };
+
+  const uploadOriginalReceipt = async (file: File, existingPreviewUrl?: string, qrPayload?: string | null) => {
+    const uploadId = Math.random().toString(36).substr(2, 9);
+    const previewUrl = existingPreviewUrl || URL.createObjectURL(file);
+    const perceptualHash = await computeImageAverageHash(file);
     const uploadItem = {
       id: uploadId,
       name: file.name,
@@ -906,15 +921,20 @@ export default function App() {
 
     try {
       const result = await createReceiptFromFile(file, {
-        autoParse: false,
+        imageProcessing: perceptualHash ? { perceptual_hash: perceptualHash } : null,
+        autoParse: true,
+        awaitParse: false,
+        parseMode: 'ocr',
+        enabledFieldKeys,
+        docType: looksLikeEInvoiceQrPayload(qrPayload) ? 'E-invoice' : null,
+        qrPayload,
       });
-      setUploadList((old: any[]) => old.map(u => u.id === uploadId ? { ...u, progress: 82, status: 'Creating review card' } : u));
+      setUploadList((old: any[]) => old.map(u => u.id === uploadId ? { ...u, progress: 62, status: 'OCR parsing in background' } : u));
       const displayReceipt = await buildDisplayReceipt(result.receipt, previewUrl);
 
       upsertHistoryReceipt(displayReceipt);
-      showToast(`${file.name} uploaded. Open it to crop and smart parse.`, 'success');
-      setUploadList((old: any[]) => old.filter((item) => item.id !== uploadId));
-      URL.revokeObjectURL(previewUrl);
+      showToast(`${file.name} uploaded. OCR started.`, 'success');
+      startReceiptResultPolling(result.receipt.id, previewUrl, uploadId);
     } catch (error) {
       console.error('Receipt upload failed:', error);
       setUploadList((old: any[]) => old.map(u => u.id === uploadId ? { ...u, status: 'Failed', progress: 100 } : u));
@@ -1045,7 +1065,11 @@ export default function App() {
         setHistory((current) => current.map((item) => item.id === receiptId ? { ...item, status: 'Processing' } : item));
       }
 
-      const result = await smartParseReceipt(receiptId);
+      const result = await smartParseReceipt(receiptId, {
+        docType: selectedReceipt.doc_type,
+        enabledFieldKeys,
+        qrPayload: selectedReceipt.extra_fields?.qr_payload,
+      });
       clearRepairProgressTimer();
       setRepairProgress({ receiptId, mode: 'smart', percent: 94, label: '同步智能解析结果到界面' });
       const originalSignedUrl = await createReceiptFileSignedUrl(result.receipt.file_path);
@@ -1059,7 +1083,6 @@ export default function App() {
 
       setHistory((current) => current.map((item) => item.id === displayReceipt.id ? displayReceipt : item));
       setSelectedReceipt(displayReceipt);
-      setImagePreviewMode(displayReceipt.processed_image_url ? 'processed' : 'original');
       setRepairProgress({ receiptId, mode: 'smart', percent: 100, label: result.parseError ? '智能解析返回错误' : '智能解析完成' });
       showToast(result.parseError || '智能解析完成。', result.parseError ? 'error' : 'success');
     } catch (error) {
@@ -1079,26 +1102,228 @@ export default function App() {
 
   const handleDelete = async (id: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
-    if (!window.confirm('确定要删除这条记录吗？')) return;
+    const reason = window.prompt('删除原因（blurry_image / duplicate / amount_not_clear / not_receipt / missing_required_info / other）', 'other');
+    if (!reason) return;
 
     try {
-      await deleteReceipt(id);
+      await softDeleteReceipt(id, { reason });
     } catch (err) {
       console.error('Failed to delete from Supabase:', err);
       showToast('Delete failed.', 'error');
       return;
     }
 
+    const deleted = history.find((item) => item.id === id);
     setHistory(prev => prev.filter(h => h.id !== id));
+    if (deleted) {
+      setDeletedReceipts((current) => [{ ...deleted, deleted_reason: reason, deleted_at: new Date().toISOString() }, ...current]);
+    }
     if (selectedReceipt?.id === id) setSelectedReceipt(null);
   };
 
+  const handleBatchDelete = async () => {
+    const targets = history.filter((item) => selectedRowIds.includes(item.id));
+    if (targets.length === 0) {
+      showToast('No receipts selected.', 'info');
+      return;
+    }
+
+    const reason = window.prompt('批量删除原因（blurry_image / duplicate / amount_not_clear / not_receipt / missing_required_info / other）', 'duplicate');
+    if (!reason) return;
+
+    try {
+      await Promise.all(targets.map((item) => softDeleteReceipt(item.id, { reason })));
+      setHistory((current) => current.filter((item) => !selectedRowIds.includes(item.id)));
+      setDeletedReceipts((current) => [
+        ...targets.map((item) => ({ ...item, deleted_reason: reason, deleted_at: new Date().toISOString() })),
+        ...current,
+      ]);
+      if (selectedReceipt && selectedRowIds.includes(selectedReceipt.id)) setSelectedReceipt(null);
+      setSelectedRowIds([]);
+      showToast(`${targets.length} receipts moved to Rejected.`, 'success');
+    } catch (error) {
+      console.error('Batch delete failed:', error);
+      showToast('Batch delete failed.', 'error');
+    }
+  };
+
+  const handleBatchMarkSynced = async () => {
+    const targets = history.filter((item) => selectedRowIds.includes(item.id));
+    if (targets.length === 0) {
+      showToast('No receipts selected.', 'info');
+      return;
+    }
+
+    try {
+      const updatedReceipts = await Promise.all(
+        targets.map((item) => saveReceipt(toApiReceipt({ ...item, status: 'Synced' }), item.items || [])),
+      );
+      const displayReceipts = await Promise.all(updatedReceipts.map((receipt) => buildDisplayReceipt(receipt)));
+      setHistory((current) => current.map((item) => displayReceipts.find((updated) => updated.id === item.id) || item));
+      setSelectedReceipt((current: any) => displayReceipts.find((updated) => updated.id === current?.id) || current);
+      setSelectedRowIds([]);
+      showToast(`${targets.length} receipts marked as synced.`, 'success');
+    } catch (error) {
+      console.error('Batch mark synced failed:', error);
+      showToast('Batch mark synced failed.', 'error');
+    }
+  };
+
+  const handleRestoreDeleted = async (id: string) => {
+    try {
+      const restored = await restoreReceipt(id);
+      const displayReceipt = await buildDisplayReceipt(restored);
+      setDeletedReceipts((current) => current.filter((item) => item.id !== id));
+      upsertHistoryReceipt(displayReceipt);
+      setSelectedDeletedIds((current) => current.filter((itemId) => itemId !== id));
+      if (selectedReceipt?.id === id) setSelectedReceipt(displayReceipt);
+      showToast('Receipt restored.', 'success');
+    } catch (error) {
+      console.error('Restore failed:', error);
+      showToast('Restore failed.', 'error');
+    }
+  };
+
+  const handlePermanentDelete = async (id: string) => {
+    if (!window.confirm('永久删除会移除数据库记录和 Storage 文件，确定继续吗？')) return;
+    try {
+      await permanentlyDeleteReceipt(id);
+      setDeletedReceipts((current) => current.filter((item) => item.id !== id));
+      setSelectedDeletedIds((current) => current.filter((itemId) => itemId !== id));
+      if (selectedReceipt?.id === id) setSelectedReceipt(null);
+      showToast('Receipt permanently deleted.', 'success');
+    } catch (error) {
+      console.error('Permanent delete failed:', error);
+      showToast('Permanent delete failed.', 'error');
+    }
+  };
+
+  const handleBatchRestoreDeleted = async () => {
+    const targets = deletedReceipts.filter((item) => selectedDeletedIds.includes(item.id));
+    if (targets.length === 0) {
+      showToast('No deleted receipts selected.', 'info');
+      return;
+    }
+
+    try {
+      const restoredReceipts = await Promise.all(targets.map((item) => restoreReceipt(item.id)));
+      const displayReceipts = await Promise.all(restoredReceipts.map((receipt) => buildDisplayReceipt(receipt)));
+      setDeletedReceipts((current) => current.filter((item) => !selectedDeletedIds.includes(item.id)));
+      setHistory((current) => [
+        ...displayReceipts,
+        ...current.filter((item) => !displayReceipts.some((restored) => restored.id === item.id)),
+      ]);
+      setSelectedDeletedIds([]);
+      showToast(`${targets.length} receipts restored.`, 'success');
+    } catch (error) {
+      console.error('Batch restore failed:', error);
+      showToast('Batch restore failed.', 'error');
+    }
+  };
+
+  const handleBatchPermanentDelete = async () => {
+    const targets = deletedReceipts.filter((item) => selectedDeletedIds.includes(item.id));
+    if (targets.length === 0) {
+      showToast('No deleted receipts selected.', 'info');
+      return;
+    }
+    if (!window.confirm(`永久删除 ${targets.length} 张收据？`)) return;
+
+    try {
+      await Promise.all(targets.map((item) => permanentlyDeleteReceipt(item.id)));
+      setDeletedReceipts((current) => current.filter((item) => !selectedDeletedIds.includes(item.id)));
+      if (selectedReceipt && selectedDeletedIds.includes(selectedReceipt.id)) setSelectedReceipt(null);
+      setSelectedDeletedIds([]);
+      showToast(`${targets.length} receipts permanently deleted.`, 'success');
+    } catch (error) {
+      console.error('Batch permanent delete failed:', error);
+      showToast('Batch permanent delete failed.', 'error');
+    }
+  };
+
+  const handleSaveFieldPreferences = async (preferences: FieldPreference[]) => {
+    setFieldPreferences(preferences);
+    try {
+      const saved = await saveFieldPreferences(preferences);
+      setFieldPreferences(saved);
+      showToast('Field preferences saved.', 'success');
+    } catch (error) {
+      console.error('Save field preferences failed:', error);
+      showToast('Field preferences saved locally only.', 'error');
+    }
+  };
+
+  const handleSaveCustomDocType = async (rawValue: string) => {
+    const value = rawValue.trim();
+    if (!value) return;
+    setCustomDocumentTypes((current) => Array.from(new Set([...current, value])));
+    setSelectedReceipt((current: any) => current ? { ...current, doc_type: 'Custom (自定义)', custom_doc_type: value } : current);
+    try {
+      await saveCustomDocumentType(value);
+      showToast('Custom document type saved.', 'success');
+    } catch (error) {
+      console.error('Save custom document type failed:', error);
+      showToast('Custom document type saved locally only.', 'error');
+    }
+  };
+
+  const handleSyncSelectedReceipt = async () => {
+    if (!selectedReceipt) return;
+    const updated = { ...selectedReceipt, status: 'Synced' };
+    setHistory(history.map(h => h.id === selectedReceipt.id ? updated : h));
+    await syncToDatabase(updated);
+    setSelectedReceipt(null);
+  };
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTyping = Boolean(target && (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable));
+
+      if (event.key === 'Escape') {
+        if (zoomImage) {
+          setZoomImage(null);
+          return;
+        }
+        if (duplicatePrompt) {
+          cancelDuplicateUpload();
+          return;
+        }
+        if (isSettingsOpen) {
+          setIsSettingsOpen(false);
+          return;
+        }
+        if (selectedReceipt) {
+          setSelectedReceipt(null);
+        }
+        return;
+      }
+
+      if (isTyping || (!event.ctrlKey && !event.metaKey)) return;
+
+      const key = event.key.toLowerCase();
+      if (key === '1' || key === '2' || key === '3') {
+        event.preventDefault();
+        setActiveTab(key === '1' ? 'upload' : key === '2' ? 'history' : 'rejected');
+      }
+      if (key === 'e') {
+        event.preventDefault();
+        void handleExport(selectedReceipt || undefined);
+      }
+      if (key === 's' && selectedReceipt && !selectedReceipt.deleted_at) {
+        event.preventDefault();
+        void handleSyncSelectedReceipt();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [duplicatePrompt, handleExport, handleSyncSelectedReceipt, isSettingsOpen, selectedReceipt, zoomImage]);
+
   const activeRepairProgress = selectedReceipt && repairProgress?.receiptId === selectedReceipt.id ? repairProgress : null;
-  const activeItemQualityWarning = selectedReceipt?.raw_ai?.parser_meta?.item_quality === 'low'
-    || /line item names look unreliable/i.test(selectedReceipt?.raw_ai?.parser_note || '');
 
   return (
-    <div className={`min-h-screen flex flex-col font-sans transition-colors duration-300 ${config.colorMode === 'Dark' ? 'bg-slate-950 text-slate-100' : 'bg-[#F1F5F9] text-slate-900'}`}>
+    <AppShell colorMode={config.colorMode}>
       {/* Toast Notification */}
       {toast && (
         <div className={`fixed top-6 left-1/2 -translate-x-1/2 z-[200] px-6 py-3 rounded-2xl shadow-2xl animate-in slide-in-from-top duration-300 flex items-center gap-3 border ${
@@ -1128,49 +1353,46 @@ export default function App() {
         />
       )}
 
+      {duplicatePrompt && (
+        <DuplicateDialog
+          filename={duplicatePrompt.file.name}
+          candidates={duplicatePrompt.candidates}
+          onCancel={cancelDuplicateUpload}
+          onContinue={continueDuplicateUpload}
+          onOpenExisting={openDuplicateCandidate}
+        />
+      )}
+
       <div className="flex flex-1 overflow-hidden">
-        {/* Sidebar */}
-        <aside className={`w-64 border-r hidden lg:flex flex-col shrink-0 z-20 transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-          <div className={`p-8 border-b ${config.colorMode === 'Dark' ? 'border-slate-800' : 'border-slate-100'}`}>
-            <div className="flex items-center gap-3">
-              <div className={`w-10 h-10 ${config.theme.color} rounded-[14px] flex items-center justify-center shadow-lg transition-all ${config.colorMode === 'Dark' ? 'shadow-black/40' : 'shadow-indigo-100'}`}>
-                <Receipt className="text-white w-6 h-6" />
-              </div>
-              <div>
-                <h1 className={`font-black tracking-tight text-lg leading-none ${config.colorMode === 'Dark' ? 'text-white' : 'text-slate-800'}`}>MY-Receipt</h1>
-                <p className={`text-[9px] font-bold mt-1 uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>PRD V1.1 PRO EDITION</p>
-              </div>
-            </div>
-          </div>
-          <nav className="p-4 space-y-1.5 flex-1">
-            <p className={`px-4 py-3 text-[10px] font-black uppercase tracking-widest ${config.colorMode === 'Dark' ? 'text-slate-600' : 'text-slate-400'}`}>Workflow</p>
-            <button onClick={() => setActiveTab('upload')} className={`w-full flex items-center justify-between px-4 py-3.5 rounded-2xl text-sm font-bold transition-all ${activeTab === 'upload' ? `${config.theme.color} text-white shadow-md` : config.colorMode === 'Dark' ? 'text-slate-400 hover:bg-slate-800' : 'text-slate-500 hover:bg-slate-50'}`}>
-              <div className="flex items-center gap-3"><RefreshCw className={`w-4 h-4 ${uploadList.length > 0 ? 'animate-spin' : ''}`} /> {t.workflow}</div>
-              {uploadList.length > 0 && <span className="bg-white/20 px-2 py-0.5 rounded-md text-[10px]">{uploadList.length}</span>}
-            </button>
-            <button onClick={() => setActiveTab('history')} className={`w-full flex items-center justify-between px-4 py-3.5 rounded-2xl text-sm font-bold transition-all ${activeTab === 'history' ? `${config.theme.color} text-white shadow-md` : config.colorMode === 'Dark' ? 'text-slate-400 hover:bg-slate-800' : 'text-slate-500 hover:bg-slate-50'}`}>
-              <div className="flex items-center gap-3"><Database className="w-4 h-4" /> {t.history}</div>
-              <span className={`px-2 py-0.5 rounded-md text-[10px] ${activeTab === 'history' ? 'bg-white/20' : config.colorMode === 'Dark' ? 'bg-slate-800 text-slate-500' : 'bg-slate-100 text-slate-400'}`}>{history.filter(h=>h.status==='Synced').length}</span>
-            </button>
-          </nav>
-          <div className={`p-6 border-t transition-colors ${config.colorMode === 'Dark' ? 'border-slate-800 bg-slate-900/50' : 'border-slate-100 bg-slate-50/50'}`}>
-             <button onClick={() => setIsSettingsOpen(true)} className={`flex items-center gap-3 px-4 py-3 w-full rounded-2xl text-sm font-bold transition-all border border-transparent ${config.colorMode === 'Dark' ? 'text-slate-400 hover:bg-slate-800 hover:border-slate-700' : 'text-slate-500 hover:bg-white hover:shadow-sm hover:border-slate-200'}`}>
-                <Settings className="w-4 h-4" /> {t.settings}
-             </button>
-          </div>
-        </aside>
+        <Sidebar
+          activeTab={activeTab}
+          uploadCount={uploadList.length}
+          syncedCount={history.filter(h => h.status === 'Synced').length}
+          deletedCount={deletedReceipts.length}
+          labels={{
+            workflow: t.workflow,
+            history: t.history,
+            settings: t.settings,
+          }}
+          config={config}
+          onTabChange={setActiveTab}
+          onSettingsOpen={() => setIsSettingsOpen(true)}
+        />
 
         {/* Main Content */}
         <div className="flex-1 flex flex-col overflow-hidden relative">
           <header className={`border-b h-16 flex items-center justify-between px-8 shrink-0 z-10 transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
              <div className="flex items-center gap-4">
                 <h2 className={`text-sm font-black uppercase tracking-widest ${config.colorMode === 'Dark' ? 'text-slate-400' : 'text-slate-800'}`}>
-                  {activeTab === 'upload' ? t.auditQueue : t.archiveLib}
+                  {activeTab === 'upload' ? t.auditQueue : activeTab === 'rejected' ? 'Rejected Receipts' : t.archiveLib}
                 </h2>
              </div>
              <div className="flex items-center gap-4">
-                <button onClick={() => handleExport()} className={`flex items-center gap-2 px-5 py-2 text-white rounded-xl text-[10px] font-black uppercase transition-all shadow-md ${config.colorMode === 'Dark' ? 'bg-indigo-600 hover:bg-indigo-500' : 'bg-slate-900 hover:bg-slate-800'}`}>
-                   <FileSpreadsheet className="w-4 h-4" /> {t.exportExcel}
+                <button onClick={handleSignOut} className={`flex items-center gap-2 px-4 py-2 border rounded-xl text-[10px] font-black uppercase transition-all shadow-sm ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
+                   <LogOut className="w-4 h-4" /> 退出登录
+                </button>
+                <button disabled={isExporting} onClick={() => handleExport()} className={`flex items-center gap-2 px-5 py-2 text-white rounded-xl text-[10px] font-black uppercase transition-all shadow-md disabled:cursor-wait disabled:opacity-60 ${config.colorMode === 'Dark' ? 'bg-indigo-600 hover:bg-indigo-500' : 'bg-slate-900 hover:bg-slate-800'}`}>
+                   <FileSpreadsheet className="w-4 h-4" /> {isExporting ? 'Generating Excel...' : t.exportExcel}
                 </button>
              </div>
           </header>
@@ -1187,31 +1409,7 @@ export default function App() {
                   <input type="file" className="hidden" multiple onChange={handleUpload} accept="image/png,image/jpeg" />
                 </label>
 
-                {uploadList.length > 0 && (
-                  <div className={`rounded-[24px] border overflow-hidden shadow-sm transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                    <div className={`px-6 py-3 border-b flex items-center justify-between ${config.colorMode === 'Dark' ? 'border-slate-800 bg-slate-900/80' : 'border-slate-100 bg-slate-50/80'}`}>
-                       <span className={`text-[10px] font-black uppercase flex items-center gap-2 ${config.theme.text}`}>
-                         <Cpu className="w-3.5 h-3.5 animate-pulse" /> {t.processing}
-                       </span>
-                    </div>
-                    {uploadList.map(item => (
-                      <div key={item.id} className={`px-6 py-4 flex items-center justify-between border-b last:border-0 ${config.colorMode === 'Dark' ? 'border-slate-800/50' : 'border-slate-50'}`}>
-                        <div className="flex items-center gap-4">
-                          <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${config.theme.light} ${config.theme.text} ${config.colorMode === 'Dark' ? 'bg-indigo-900/30' : ''}`}>
-                            <FileText className="w-4 h-4" />
-                          </div>
-                          <div>
-                            <p className="text-xs font-bold">{item.name}</p>
-                            <p className="text-[10px] font-black opacity-50 uppercase">{item.status}</p>
-                          </div>
-                        </div>
-                        <div className={`w-48 h-1.5 rounded-full overflow-hidden ${config.colorMode === 'Dark' ? 'bg-slate-800' : 'bg-slate-100'}`}>
-                          <div className={`${config.theme.color} h-full transition-all duration-300`} style={{ width: `${item.progress}%` }}></div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                <UploadQueue items={uploadList} processingLabel={t.processing} config={config} />
 
                 <div className="space-y-4">
                   <div className="flex flex-wrap gap-3 items-center p-2">
@@ -1233,7 +1431,7 @@ export default function App() {
                      <div className="relative">
                         <select value={filters.docType} onChange={e => setFilters({...filters, docType: e.target.value})} className={`appearance-none border rounded-xl pl-4 pr-10 py-2.5 text-xs font-black outline-none shadow-sm transition-all cursor-pointer ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800 text-slate-400 focus:border-indigo-500' : 'bg-white border-slate-200 text-slate-600 focus:border-indigo-500'}`}>
                            <option value="All">{t.typeAll}</option>
-                           {DOC_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+                           {documentTypeOptions.map(t => <option key={t} value={t}>{t}</option>)}
                         </select>
                         <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
                      </div>
@@ -1247,104 +1445,75 @@ export default function App() {
                      </div>
                   </div>
 
-                  <div className={`rounded-[24px] border shadow-sm overflow-hidden transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                    <table className="w-full text-left">
-                      <thead className={`text-[10px] font-black uppercase tracking-widest border-b ${config.colorMode === 'Dark' ? 'bg-slate-800/50 text-slate-500 border-slate-800' : 'bg-slate-50 text-slate-500 border-slate-100'}`}>
-                        <tr>
-                          <th className="px-6 py-4 w-10">
-                            <input 
-                              type="checkbox" 
-                              checked={selectedRowIds.length === filteredHistory.filter(isSelectableForBulk).length && filteredHistory.filter(isSelectableForBulk).length > 0}
-                              onChange={handleToggleSelectAll}
-                              className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                            />
-                          </th>
-                          <th className="px-6 py-4">{t.merchantLabel}</th>
-                          <th className="px-6 py-4">{t.financialsLabel}</th>
-                          <th className="px-6 py-4">{t.tagsLabel}</th>
-                          <th className="px-6 py-4 text-right">{t.auditLabel}</th>
-                        </tr>
-                      </thead>
-                      <tbody className={`divide-y ${config.colorMode === 'Dark' ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                        {filteredHistory.filter(h => h.status !== 'Synced').map(item => (
-                          <tr key={item.id} className={`transition-colors group cursor-pointer ${selectedRowIds.includes(item.id) ? (config.colorMode === 'Dark' ? 'bg-indigo-900/20' : 'bg-indigo-50/50') : ''} ${config.colorMode === 'Dark' ? 'hover:bg-slate-800/50' : 'hover:bg-slate-50'}`} onClick={() => setSelectedReceipt(item)}>
-                            <td className="px-6 py-5" onClick={(e) => handleToggleSelectRow(item.id, e)}>
-                              <input 
-                                type="checkbox" 
-                                checked={selectedRowIds.includes(item.id)}
-                                disabled={!isSelectableForBulk(item)}
-                                onChange={() => {}} // Handle via onClick of cell
-                                className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                              />
-                            </td>
-                            <td className="px-6 py-5">
-                               <div className="flex items-start gap-3">
-                                  <div className="mt-0.5">
-                                     {item.status === 'Failed' ? (
-                                       <AlertCircle className="w-5 h-5 text-rose-500" />
-                                     ) : item.status === 'Processing' ? (
-                                       <Loader2 className={`w-5 h-5 animate-spin ${config.colorMode === 'Dark' ? 'text-indigo-400' : 'text-indigo-600'}`} />
-                                     ) : item.status === 'Uploaded' ? (
-                                       <Clock className={`w-5 h-5 ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`} />
-                                     ) : (
-                                       <CheckCircle className={`w-5 h-5 ${config.colorMode === 'Dark' ? 'text-amber-600' : 'text-amber-500'}`} />
-                                     )}
-                                  </div>
-                                  <div>
-                                    <p className={`text-sm font-black leading-tight mb-1 ${item.status === 'Failed' ? 'text-rose-600' : config.colorMode === 'Dark' ? 'text-slate-200' : 'text-slate-800'}`}>
-                                      {item.merchant_name || item.filename || 'Processing receipt'}
-                                    </p>
-                                    <div className="flex gap-2">
-                                       <span className={`text-[9px] font-bold uppercase ${config.colorMode === 'Dark' ? 'text-slate-600' : 'text-slate-400'}`}>
-                                         {item.status === 'Uploaded' ? 'Ready for crop and smart parse' : item.status === 'Processing' ? 'Smart parsing in background' : `INV: ${item.invoice_no || 'N/A'}`}
-                                       </span>
-                                    </div>
-                                  </div>
-                               </div>
-                            </td>
-                            <td className="px-6 py-5">
-                               <p className={`text-sm font-black leading-none mb-1 ${config.colorMode === 'Dark' ? 'text-slate-200' : 'text-slate-900'}`}>{config.currency} {parseFloat(item.grand_total as any).toFixed(2)}</p>
-                               <p className={`text-[10px] font-bold ${config.colorMode === 'Dark' ? 'text-slate-600' : 'text-slate-400'}`}>{item.date} • {item.items?.length || 0} SKUs</p>
-                            </td>
-                            <td className="px-6 py-5">
-                               <div className="flex flex-col gap-1.5 items-start">
-                                  <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase ${item.status === 'Failed' ? 'bg-rose-50 text-rose-600' : item.status === 'Processing' ? 'bg-indigo-50 text-indigo-600' : config.colorMode === 'Dark' ? 'bg-indigo-950 text-indigo-400' : 'bg-indigo-50 text-indigo-600'}`}>
-                                    {item.status === 'Uploaded' ? 'Uploaded' : item.status === 'Processing' ? 'Processing' : item.doc_type}
-                                  </span>
-                                  <div className="flex flex-wrap gap-1">
-                                    {(item.tags || []).slice(0,2).map(t => <span key={t} className={`text-[8px] font-black uppercase px-1 rounded ${config.colorMode === 'Dark' ? 'bg-slate-800 text-slate-500' : 'bg-slate-100 text-slate-500'}`}>{t}</span>)}
-                                  </div>
-                               </div>
-                            </td>
-                            <td className="px-6 py-5 text-right">
-                               <div className="flex items-center justify-end gap-2">
-                                 {item.status === 'Failed' ? (
-                                    <button onClick={(e) => { e.stopPropagation(); handleRetry(item.id); }} className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded-lg text-[10px] font-black uppercase transition-all flex items-center gap-1">
-                                       <RefreshCcw className="w-3 h-3" /> {t.retry}
-                                    </button>
-                                 ) : (
-                                    <button className={`p-2 rounded-xl transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 text-slate-500 group-hover:bg-indigo-600 group-hover:text-white' : 'bg-slate-100 text-slate-400 group-hover:bg-indigo-600 group-hover:text-white'}`}>
-                                      <ChevronRight className="w-5 h-5" />
-                                    </button>
-                                 )}
-                                 <button onClick={(e) => handleDelete(item.id, e)} className={`p-2 rounded-xl transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 text-slate-500 hover:bg-rose-600 hover:text-white' : 'bg-slate-100 text-slate-400 hover:bg-rose-600 hover:text-white'}`} title="删除">
-                                   <Trash2 className="w-4 h-4" />
-                                 </button>
-                               </div>
-                            </td>
-                          </tr>
-                        ))}
-                        {filteredHistory.filter(h => h.status !== 'Synced').length === 0 && (
-                          <tr><td colSpan={4} className="px-6 py-12 text-center text-slate-400 text-xs font-bold">{t.noRecords}</td></tr>
-                        )}
-                      </tbody>
-                    </table>
-                    <div className={`px-6 py-3 border-t flex justify-between items-center text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'bg-slate-800/30 border-slate-800 text-slate-600' : 'bg-slate-50 border-slate-100 text-slate-400'}`}>
-                       <span>Total: {filteredHistory.filter(h => h.status !== 'Synced').length} {t.totalItems}</span>
-                       <span>Page 1 of 1</span>
+                  {selectedRowIds.length > 0 && (
+                    <div className={`mx-2 flex flex-wrap items-center justify-between gap-3 rounded-2xl border px-4 py-3 ${config.colorMode === 'Dark' ? 'border-indigo-900 bg-indigo-950/30' : 'border-indigo-100 bg-indigo-50'}`}>
+                      <p className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-indigo-200' : 'text-indigo-700'}`}>{selectedRowIds.length} selected</p>
+                      <div className="flex flex-wrap gap-2">
+                        <button type="button" onClick={() => handleExport()} className="rounded-xl bg-white px-3 py-2 text-[10px] font-black uppercase text-slate-700 shadow-sm hover:bg-slate-50">Export selected</button>
+                        <button type="button" onClick={handleBatchMarkSynced} className="rounded-xl bg-emerald-600 px-3 py-2 text-[10px] font-black uppercase text-white shadow-sm hover:bg-emerald-500">Mark synced</button>
+                        <button type="button" onClick={handleBatchDelete} className="rounded-xl bg-rose-600 px-3 py-2 text-[10px] font-black uppercase text-white shadow-sm hover:bg-rose-500">Delete selected</button>
+                      </div>
+                    </div>
+                  )}
+
+                  <ReceiptTable
+                    items={filteredHistory}
+                    selectedRowIds={selectedRowIds}
+                    labels={{
+                      merchantLabel: t.merchantLabel,
+                      financialsLabel: t.financialsLabel,
+                      tagsLabel: t.tagsLabel,
+                      auditLabel: t.auditLabel,
+                      retry: t.retry,
+                      noRecords: t.noRecords,
+                      totalItems: t.totalItems,
+                    }}
+                    config={config}
+                    isSelectableForBulk={isSelectableForBulk}
+                    onToggleSelectAll={handleToggleSelectAll}
+                    onToggleSelectRow={handleToggleSelectRow}
+                    onOpenReceipt={setSelectedReceipt}
+                    onCopyText={handleCopyText}
+                    onRetry={handleRetry}
+                    onDelete={handleDelete}
+                  />
+                </div>
+              </div>
+            ) : activeTab === 'rejected' ? (
+              <div className="max-w-6xl mx-auto space-y-6">
+                {deletedReceipts.length > 0 && (
+                  <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-4">
+                    <label className="flex items-center gap-2 text-[10px] font-black uppercase text-slate-500">
+                      <input
+                        type="checkbox"
+                        checked={selectedDeletedIds.length === deletedReceipts.length}
+                        onChange={() => setSelectedDeletedIds((current) => current.length === deletedReceipts.length ? [] : deletedReceipts.map((receipt) => receipt.id))}
+                        className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                      />
+                      {selectedDeletedIds.length} selected
+                    </label>
+                    <div className="flex flex-wrap gap-2">
+                      <button type="button" onClick={handleBatchRestoreDeleted} className="rounded-xl bg-emerald-50 px-3 py-2 text-[10px] font-black uppercase text-emerald-700 hover:bg-emerald-100">Restore selected</button>
+                      <button type="button" onClick={handleBatchPermanentDelete} className="rounded-xl bg-rose-50 px-3 py-2 text-[10px] font-black uppercase text-rose-700 hover:bg-rose-100">Delete selected</button>
                     </div>
                   </div>
-                </div>
+                )}
+                <DeletedReceiptList
+                  receipts={deletedReceipts.map(toApiReceipt)}
+                  selectedIds={selectedDeletedIds}
+                  onToggleSelect={(id) => setSelectedDeletedIds((current) => current.includes(id) ? current.filter((itemId) => itemId !== id) : [...current, id])}
+                  onOpen={(id) => {
+                    const found = deletedReceipts.find((receipt) => receipt.id === id);
+                    if (found) setSelectedReceipt(found);
+                  }}
+                  onCopyReuploadMessage={(message) => {
+                    void copyTextToClipboard(message)
+                      .then(() => showToast('Reupload request copied.', 'success'))
+                      .catch(() => showToast('Copy failed.', 'error'));
+                  }}
+                  onRestore={handleRestoreDeleted}
+                  onPermanentDelete={handlePermanentDelete}
+                />
               </div>
             ) : (
               <div className="max-w-6xl mx-auto space-y-6">
@@ -1387,497 +1556,41 @@ export default function App() {
         </div>
       </div>
 
-      {/* 核心校对面板 - 依据用户期望的 3列宽屏 布局重构 */}
+      {/* Receipt review drawer */}
       {selectedReceipt && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
-           <div className={`w-full max-w-[98vw] h-[96vh] rounded-[32px] shadow-2xl overflow-hidden flex flex-col transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-900 border border-slate-800' : 'bg-white'}`}>
-              {/* 面板头部 */}
-              <div className={`px-8 py-4 border-b flex items-center justify-between shrink-0 transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-800/20 border-slate-800' : 'bg-slate-50/50 border-slate-100'}`}>
-                 <div className="flex items-center gap-4">
-                    <div className={`w-10 h-10 ${selectedReceipt.status === 'Failed' ? 'bg-rose-600' : config.theme.color} rounded-xl flex items-center justify-center text-white shadow-md`}>
-                       {selectedReceipt.status === 'Failed' ? <AlertTriangle className="w-5 h-5" /> : <ShoppingCart className="w-5 h-5" />}
-                    </div>
-                    <div>
-                       <h2 className={`text-lg font-black tracking-tight flex items-center gap-2 ${config.colorMode === 'Dark' ? 'text-white' : 'text-slate-900'}`}>
-                          {selectedReceipt.merchant_name || selectedReceipt.filename || 'Processing receipt'}
-                          <span className={`px-2 py-0.5 rounded text-[9px] uppercase ${selectedReceipt.status === 'Failed' ? 'bg-rose-100 text-rose-700' : 'bg-emerald-100 text-emerald-700'}`}>
-                             {t.confidence}: {(selectedReceipt.confidence_score * 100).toFixed(0)}%
-                          </span>
-                       </h2>
-                       <p className={`text-[10px] font-bold uppercase mt-0.5 ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>Processing Time: {selectedReceipt.time || '10:20'}</p>
-                    </div>
-                 </div>
-                 <div className="flex items-center gap-3">
-                    <button
-                       onClick={handleSmartParse}
-                       disabled={smartParsingReceiptId === selectedReceipt.id || selectedReceipt.status === 'Processing'}
-                       className={`px-5 py-2.5 border rounded-xl text-[10px] font-black flex items-center gap-2 transition-all shadow-sm disabled:opacity-60 disabled:cursor-wait ${config.colorMode === 'Dark' ? 'bg-indigo-950/60 border-indigo-900 text-indigo-300 hover:bg-indigo-900' : 'bg-indigo-50 border-indigo-100 text-indigo-700 hover:bg-indigo-100'}`}
-                    >
-                       <Cpu className={`w-3.5 h-3.5 ${smartParsingReceiptId === selectedReceipt.id ? 'animate-pulse' : ''}`} />
-                       {activeRepairProgress?.mode === 'smart' ? `智能解析 ${activeRepairProgress.percent}%` : selectedReceipt.status === 'Processing' ? '智能解析中' : '智能解析'}
-                    </button>
-                    <button onClick={() => handleExport(selectedReceipt)} className={`px-4 py-2 border rounded-xl text-[10px] font-black flex items-center gap-2 transition-all shadow-sm ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
-                       <FileOutput className="w-3.5 h-3.5" /> Export (XLSX)
-                    </button>
-                    <button onClick={() => setSelectedReceipt(null)} className={`p-2 border rounded-xl transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-slate-400 hover:bg-slate-700' : 'bg-white border-slate-200 text-slate-400 hover:bg-slate-100'}`} title="关闭编辑页">
-                       <X className="w-5 h-5" />
-                    </button>
-                 </div>
-              </div>
-
-              {activeRepairProgress && (
-                <div className={`px-8 py-3 border-b transition-colors ${config.colorMode === 'Dark' ? 'bg-indigo-950/30 border-indigo-900/50' : 'bg-indigo-50/80 border-indigo-100'}`}>
-                  <div className="flex items-center justify-between gap-4">
-                    <div className={`flex items-center gap-2 text-[10px] font-black uppercase tracking-wide ${config.colorMode === 'Dark' ? 'text-indigo-200' : 'text-indigo-700'}`}>
-                      <Cpu className="w-3.5 h-3.5 animate-pulse" />
-                      <span>{activeRepairProgress.label}</span>
-                    </div>
-                    <span className={`text-[10px] font-black tabular-nums ${config.colorMode === 'Dark' ? 'text-indigo-300' : 'text-indigo-700'}`}>
-                      {activeRepairProgress.percent}%
-                    </span>
-                  </div>
-                  <div className={`mt-2 h-1.5 rounded-full overflow-hidden ${config.colorMode === 'Dark' ? 'bg-slate-800' : 'bg-white'}`}>
-                    <div
-                      className="h-full rounded-full bg-indigo-600 transition-all duration-700 ease-out"
-                      style={{ width: `${activeRepairProgress.percent}%` }}
-                    />
-                  </div>
-                </div>
-              )}
-
-              {/* 3列布局主内容区 */}
-              <div className="flex-1 flex overflow-hidden">
-                 
-                 {/* 左侧：发票原图常驻预览 (25%) */}
-                 <div className={`w-[25%] p-6 flex flex-col border-r relative transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-950/50 border-slate-800' : 'bg-slate-100/80 border-slate-200'}`}>
-                    <h4 className={`text-[11px] font-black uppercase tracking-[2px] flex items-center gap-2 mb-4 ${config.colorMode === 'Dark' ? 'text-slate-600' : 'text-slate-500'}`}>
-                       <Eye className="w-4 h-4" /> {imagePreviewMode === 'processed' ? '识别图' : t.originalImg}
-                    </h4>
-                    {selectedReceipt.processed_image_url && selectedReceipt.original_image_url && (
-                       <div className={`mb-4 grid grid-cols-2 gap-1 rounded-xl p-1 text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'bg-slate-900' : 'bg-white'}`}>
-                          <button
-                             type="button"
-                             onClick={() => setImagePreviewMode('processed')}
-                             className={`rounded-lg px-3 py-2 transition ${imagePreviewMode === 'processed' ? `${config.theme.color} text-white` : 'text-slate-500 hover:bg-slate-50'}`}
-                          >
-                             识别图
-                          </button>
-                          <button
-                             type="button"
-                             onClick={() => setImagePreviewMode('original')}
-                             className={`rounded-lg px-3 py-2 transition ${imagePreviewMode === 'original' ? `${config.theme.color} text-white` : 'text-slate-500 hover:bg-slate-50'}`}
-                          >
-                             原图
-                          </button>
-                       </div>
-                    )}
-                    <div className={`flex-1 rounded-[24px] overflow-hidden border shadow-sm flex items-center justify-center relative group ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                       {selectedReceiptImageUrl ? (
-                          <>
-                             <img 
-                               src={selectedReceiptImageUrl}
-                               onError={(e: any) => { e.target.onerror = null; e.target.src = '/input_file_2.png'; }} 
-                               alt="Original Receipt" 
-                               className="w-full h-full object-contain cursor-zoom-in" 
-                               onClick={() => setZoomImage(selectedReceiptImageUrl)}
-                               referrerPolicy="no-referrer"
-                             />
-                             
-                             <button 
-                                onClick={() => setZoomImage(selectedReceiptImageUrl)}
-                                className="absolute bottom-4 right-4 px-3 py-2 bg-slate-900/70 hover:bg-slate-900 text-white rounded-xl backdrop-blur-md opacity-0 group-hover:opacity-100 transition-all flex items-center gap-2 text-[10px] font-black uppercase shadow-xl"
-                             >
-                                <ZoomIn className="w-4 h-4" /> {t.zoomTip}
-                             </button>
-                          </>
-                       ) : (
-                          <div className="text-slate-400 text-[10px] font-bold flex flex-col items-center gap-2">
-                            <Eye className="w-6 h-6 opacity-20" />
-                            暂无原图记录
-                          </div>
-                       )}
-                    </div>
-                    {(selectedReceipt.subsidy_info || hasSubsidyDetails(selectedSubsidyDetails)) && (
-                       <div className="mt-4 p-4 bg-amber-500/10 border border-amber-500/20 rounded-xl">
-                          <p className={`text-[9px] font-black uppercase mb-1 ${config.colorMode === 'Dark' ? 'text-amber-500' : 'text-amber-700'}`}>政府补贴 / 援助金</p>
-                          <p className={`text-xs font-black leading-tight ${config.colorMode === 'Dark' ? 'text-amber-200' : 'text-amber-900'}`}>{selectedReceipt.subsidy_info || formatSubsidyHeadline(selectedSubsidyDetails)}</p>
-                          {selectedSubsidyRows.length > 0 && (
-                            <div className="mt-3 grid grid-cols-2 gap-2">
-                              {selectedSubsidyRows.slice(0, 6).map((row) => (
-                                <div key={row.label} className={`rounded-lg px-2 py-1.5 ${config.colorMode === 'Dark' ? 'bg-slate-950/40' : 'bg-white/70'}`}>
-                                  <p className="text-[8px] font-black uppercase text-slate-400">{row.label}</p>
-                                  <p className={`truncate text-[10px] font-black ${config.colorMode === 'Dark' ? 'text-slate-100' : 'text-slate-800'}`}>{row.value}</p>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                       </div>
-                    )}
-                    {(selectedReceipt.raw_ocr || selectedReceipt.raw_ai?.parser_note) && (
-                       <details className={`mt-4 rounded-xl border p-4 text-xs ${config.colorMode === 'Dark' ? 'border-slate-800 bg-slate-900 text-slate-400' : 'border-slate-200 bg-white text-slate-500'}`}>
-                          <summary className="cursor-pointer text-[10px] font-black uppercase tracking-widest text-slate-500">OCR 原文 / 解析说明</summary>
-                          {selectedReceipt.raw_ai?.parser_note && (
-                             <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-[10px] font-bold leading-5 text-amber-700">{selectedReceipt.raw_ai.parser_note}</p>
-                          )}
-                          {selectedReceipt.raw_ocr && (
-                             <pre className="mt-3 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-950 p-3 text-[10px] leading-5 text-slate-100">{selectedReceipt.raw_ocr}</pre>
-                          )}
-                       </details>
-                    )}
-                 </div>
-
-                 {/* 右侧：结构化工作台 (75%) */}
-                 <div className={`w-[75%] flex flex-col overflow-y-auto ${config.colorMode === 'Dark' ? 'bg-slate-900/50' : 'bg-slate-50/30'}`}>
-                    
-                    {/* 上部：抬头、商户信息与分类标签 */}
-                    <div className={`p-8 border-b space-y-6 transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                       <section className="space-y-4">
-                          <h4 className={`text-[11px] font-black ${config.theme.text} uppercase tracking-[2px] flex items-center gap-2`}>
-                             <Building2 className="w-4 h-4" /> {t.merchantInfo}
-                          </h4>
-                          <div className="grid grid-cols-4 gap-6">
-                             {/* 基础信息区 */}
-                             <div className="col-span-4 lg:col-span-3 grid grid-cols-6 gap-4">
-                                <div className="col-span-6 xl:col-span-4 space-y-1.5">
-                                   <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>商户名称 (Merchant)</label>
-                                   <input type="text" value={selectedReceipt.merchant_name || ''} onChange={(e) => setSelectedReceipt({...selectedReceipt, merchant_name: e.target.value})} className={`w-full border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
-                                </div>
-                                <div className="col-span-6 sm:col-span-2 xl:col-span-2 space-y-1.5">
-                                   <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>日期 (Date)</label>
-                                   <input type="text" value={selectedReceipt.date || ''} onChange={(e) => setSelectedReceipt({...selectedReceipt, date: e.target.value})} className={`w-full border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
-                                </div>
-                                <div className="col-span-6 xl:col-span-2 space-y-1.5">
-                                   <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>发票号 (Invoice No)</label>
-                                   <input type="text" value={selectedReceipt.invoice_no || ''} onChange={(e) => setSelectedReceipt({...selectedReceipt, invoice_no: e.target.value})} className={`w-full border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
-                                </div>
-                                <div className="col-span-6 xl:col-span-2 space-y-1.5">
-                                   <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>注册号 (Reg No)</label>
-                                   <input type="text" value={selectedReceipt.company_reg_no || ''} onChange={(e) => setSelectedReceipt({...selectedReceipt, company_reg_no: e.target.value})} className={`w-full border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
-                                </div>
-                                <div className="col-span-6 xl:col-span-2 space-y-1.5">
-                                   <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>SST ID</label>
-                                   <input type="text" value={selectedReceipt.sst_no || ''} onChange={(e) => setSelectedReceipt({...selectedReceipt, sst_no: e.target.value})} className={`w-full border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
-                                </div>
-                                <div className="col-span-6 xl:col-span-4 space-y-1.5">
-                                   <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>电话 (Phone) & 支付 (Payment)</label>
-                                   <div className="flex gap-2">
-                                      <input type="text" value={selectedReceipt.phone || ''} placeholder="Phone" onChange={(e) => setSelectedReceipt({...selectedReceipt, phone: e.target.value})} className={`w-1/2 border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
-                                      <input type="text" value={selectedReceipt.payment_method || ''} placeholder="Payment" onChange={(e) => setSelectedReceipt({...selectedReceipt, payment_method: e.target.value})} className={`w-1/2 border rounded-xl px-4 py-2.5 text-sm font-black focus:ring-2 outline-none transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10'}`} />
-                                   </div>
-                                </div>
-                             </div>
-
-                             {/* 分类与标签区 */}
-                             <div className={`col-span-4 lg:col-span-1 flex flex-col gap-4 border-t lg:border-t-0 lg:border-l pt-4 lg:pt-0 lg:pl-6 ${config.colorMode === 'Dark' ? 'border-slate-800' : 'border-slate-100'}`}>
-                                <div className="space-y-1.5">
-                                   <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>单据类型 & 行业</label>
-                                   <div className="flex gap-2">
-                                       <div className="relative min-w-32 flex-1">
-                                          <select value={selectedReceipt.doc_type} onChange={(e) => setSelectedReceipt({...selectedReceipt, doc_type: e.target.value})} className={`w-full appearance-none border rounded-xl pl-3 pr-8 py-2.5 text-xs font-black outline-none focus:ring-2 transition-all cursor-pointer ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20 focus:bg-slate-700' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10 focus:bg-white'}`}>
-                                             {DOC_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
-                                          </select>
-                                          <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 w-3 h-3 text-slate-400 pointer-events-none" />
-                                       </div>
-                                       <div className="relative min-w-28 flex-1">
-                                          <select value={selectedReceipt.industry} onChange={(e) => setSelectedReceipt({...selectedReceipt, industry: e.target.value})} className={`w-full appearance-none border rounded-xl pl-3 pr-8 py-2.5 text-xs font-black outline-none focus:ring-2 transition-all cursor-pointer ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/20 focus:bg-slate-700' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/10 focus:bg-white'}`}>
-                                             {INDUSTRIES.map(t => <option key={t} value={t}>{t}</option>)}
-                                          </select>
-                                          <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 w-3 h-3 text-slate-400 pointer-events-none" />
-                                       </div>
-                                   </div>
-                                </div>
-                                <div className="space-y-1.5">
-                                   <label className={`text-[10px] font-black uppercase ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>快捷标签</label>
-                                   <div className="flex flex-wrap gap-1.5">
-                                      {Array.from(new Set([...TAGS_OPTIONS, ...(selectedReceipt.tags || [])])).map(tag => (
-                                          <button key={tag} type="button" onClick={() => toggleTag(tag)} className={`px-2.5 py-1 rounded-lg text-[9px] font-black transition-all ${selectedReceipt.tags?.includes(tag) ? config.theme.color + ' text-white shadow-sm' : config.colorMode === 'Dark' ? 'bg-slate-800 text-slate-500 hover:bg-slate-700' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
-                                             {tag}
-                                          </button>
-                                       ))}
-                                   </div>
-                                   <div className="flex items-center gap-1 mt-1">
-                                      <input type="text" value={newTagInput} onChange={(e) => setNewTagInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleAddCustomTag(e)} placeholder="+ 自定义标签" className={`flex-1 border rounded-lg px-2 py-1.5 text-[10px] font-black outline-none focus:ring-1 ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700 text-white focus:ring-indigo-500/50' : 'bg-slate-50 border-slate-100 text-slate-800 focus:ring-indigo-500/20'}`} />
-                                      <button type="button" onClick={() => handleAddCustomTag()} className={`px-2.5 py-1.5 ${config.theme.color} text-white rounded-lg text-[10px] font-black uppercase hover:brightness-110 transition-all`}>添加</button>
-                                   </div>
-                                </div>
-                             </div>
-                          </div>
-                       </section>
-                    </div>
-
-                    {/* 中部：商品明细表 (SKU) */}
-                    <div className="p-8 flex-1 flex flex-col">
-                       <div className="flex items-center justify-between mb-4">
-                          <h4 className={`text-[11px] font-black ${config.theme.text} uppercase tracking-[2px] flex items-center gap-2`}>
-                             <ShoppingCart className="w-4 h-4" /> {t.skuItems}
-                          </h4>
-                          <button type="button" onClick={addNewItem} className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase flex items-center gap-1 hover:brightness-95 transition-all ${config.colorMode === 'Dark' ? 'bg-indigo-900/30 text-indigo-400' : `${config.theme.light} ${config.theme.text}`}`}>
-                             <Plus className="w-3.5 h-3.5" /> SKU
-                          </button>
-                       </div>
-                       {activeItemQualityWarning && (
-                          <div className={`mb-4 rounded-xl border px-4 py-3 text-[10px] font-bold leading-5 ${config.colorMode === 'Dark' ? 'border-amber-800 bg-amber-950/30 text-amber-200' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
-                             <div className="flex items-start gap-2">
-                                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                                <span>DeepSeek 已完成文本修复，但商品明细名称质量偏低。当前 OCR 文本可能已经损坏，请对照左侧图片人工补全，或改用视觉模型重解析。</span>
-                             </div>
-                          </div>
-                       )}
-                       
-                       <div className={`border rounded-[20px] overflow-hidden shadow-sm flex-1 transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                          <table className="w-full text-left text-sm">
-                             <thead className={`text-[9px] font-black uppercase border-b ${config.colorMode === 'Dark' ? 'bg-slate-800/50 text-slate-600 border-slate-800' : 'bg-slate-50/80 text-slate-500 border-slate-100'}`}>
-                                <tr>
-                                   <th className="px-5 py-3">Item Description</th>
-                                   <th className="px-3 py-3 w-20 text-center">Qty</th>
-                                   <th className="px-3 py-3 w-28 text-right">Unit {config.currency}</th>
-                                   <th className="px-5 py-3 w-28 text-right">Line {config.currency}</th>
-                                   <th className="px-3 py-3 w-10 text-center"></th>
-                                </tr>
-                             </thead>
-                             <tbody className={`divide-y ${config.colorMode === 'Dark' ? 'divide-slate-800' : 'divide-slate-50'}`}>
-                                {(selectedReceipt.items || []).map((item: any) => (
-                                   <tr key={item.id} className="group transition-colors">
-                                      <td className="px-5 py-2">
-                                         <input type="text" value={item.name || ''} onChange={(e) => updateItem(item.id, 'name', e.target.value)} placeholder="名称" className={`w-full bg-transparent border-none p-1.5 text-xs font-black focus:ring-1 rounded ${config.colorMode === 'Dark' ? 'text-slate-300 focus:ring-slate-700 focus:bg-slate-800' : 'text-slate-700 focus:ring-slate-200 focus:bg-white'}`} />
-                                      </td>
-                                      <td className="px-3 py-2">
-                                         <input type="number" step="0.001" value={item.qty === 0 ? '' : item.qty} onChange={(e) => updateItem(item.id, 'qty', e.target.value)} className={`w-full bg-transparent border-none p-1.5 text-xs font-black focus:ring-1 rounded text-center ${config.colorMode === 'Dark' ? 'text-slate-400 focus:ring-slate-700 focus:bg-slate-800' : 'text-slate-600 focus:ring-slate-200 focus:bg-white'}`} />
-                                      </td>
-                                      <td className="px-3 py-2">
-                                         <input type="number" step="0.01" value={item.unit_price === 0 ? '' : item.unit_price} onChange={(e) => updateItem(item.id, 'unit_price', e.target.value)} onBlur={(e) => updateItem(item.id, 'unit_price', (parseFloat(e.target.value) || 0).toFixed(2))} className={`w-full bg-transparent border-none p-1.5 text-xs font-black focus:ring-1 rounded text-right ${config.colorMode === 'Dark' ? 'text-slate-400 focus:ring-slate-700 focus:bg-slate-800' : 'text-slate-600 focus:ring-slate-200 focus:bg-white'}`} />
-                                      </td>
-                                      <td className={`px-5 py-2 text-right text-xs font-black ${config.colorMode === 'Dark' ? 'text-white' : 'text-slate-900'}`}>{item.line_total.toFixed(2)}</td>
-                                      <td className="px-3 py-2 text-center">
-                                         <button type="button" onClick={() => removeItem(item.id)} className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-all" title="删除"><Trash2 className="w-3.5 h-3.5" /></button>
-                                      </td>
-                                   </tr>
-                                ))}
-                                {(!selectedReceipt.items || selectedReceipt.items.length === 0) && (
-                                   <tr><td colSpan={5} className="px-5 py-8 text-center text-[10px] font-bold text-slate-400">暂无明细记录，请手动添加。</td></tr>
-                                )}
-                             </tbody>
-                          </table>
-                       </div>
-                    </div>
-
-                    {/* 下部：财务汇总和自动数学校验引擎 */}
-                    <div className={`p-8 border-t shadow-[0_-10px_30px_rgba(0,0,0,0.02)] z-10 flex flex-col gap-6 transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                       <h4 className={`text-[11px] font-black ${config.theme.text} uppercase tracking-[2px] flex items-center gap-2`}>
-                        <Calculator className="w-4 h-4" /> {t.calculator}
-                       </h4>
-                       
-                       <div className={`grid grid-cols-6 gap-4 text-xs font-bold ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-600'}`}>
-                          <div className="space-y-1.5">
-                             <span className="block text-[10px] text-slate-400 uppercase">Subtotal (Items)</span>
-                             <div className={`w-full border border-transparent rounded-lg px-3 py-2.5 text-right font-black transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-800 text-white' : 'bg-slate-50 text-slate-900'}`}>{config.currency} {itemsTotal.toFixed(2)}</div>
-                          </div>
-                          <div className="space-y-1.5">
-                             <span className="block text-[10px] text-rose-500 uppercase">Discount (-)</span>
-                             <input type="number" value={selectedReceipt.discount === 0 ? '' : selectedReceipt.discount} onChange={(e) => setSelectedReceipt({...selectedReceipt, discount: e.target.value})} className={`w-full border rounded-lg px-3 py-2.5 text-right text-rose-600 outline-none focus:ring-1 ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-100 focus:ring-slate-200'}`} placeholder="0" />
-                          </div>
-                          <div className="space-y-1.5">
-                             <span className="block text-[10px] text-slate-400 uppercase">Service Chg (+)</span>
-                             <input type="number" value={selectedReceipt.service_charge === 0 ? '' : selectedReceipt.service_charge} onChange={(e) => setSelectedReceipt({...selectedReceipt, service_charge: e.target.value})} className={`w-full border rounded-lg px-3 py-2.5 text-right outline-none focus:ring-1 ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-100 focus:ring-slate-200'}`} placeholder="0" />
-                          </div>
-                          <div className="space-y-1.5">
-                             <span className="block text-[10px] text-slate-400 uppercase">Tax/SST (+)</span>
-                             <input type="number" value={selectedReceipt.tax_sst === 0 ? '' : selectedReceipt.tax_sst} onChange={(e) => setSelectedReceipt({...selectedReceipt, tax_sst: e.target.value})} className={`w-full border rounded-lg px-3 py-2.5 text-right outline-none focus:ring-1 ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-100 focus:ring-slate-200'}`} placeholder="0" />
-                          </div>
-                          <div className="space-y-1.5">
-                             <span className="block text-[10px] text-slate-400 uppercase">Rounding (+/-)</span>
-                             <input type="number" value={selectedReceipt.rounding === 0 ? '' : selectedReceipt.rounding} onChange={(e) => setSelectedReceipt({...selectedReceipt, rounding: e.target.value})} className={`w-full border rounded-lg px-3 py-2.5 text-right outline-none focus:ring-1 ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-100 focus:ring-slate-200'}`} placeholder="0" />
-                          </div>
-                          <div className="space-y-1.5">
-                             <span className="block text-[10px] text-slate-400 uppercase">Change (找零)</span>
-                             <input type="number" value={selectedReceipt.change === 0 ? '' : selectedReceipt.change} onChange={(e) => setSelectedReceipt({...selectedReceipt, change: e.target.value})} className={`w-full border rounded-lg px-3 py-2.5 text-right outline-none focus:ring-1 ${config.colorMode === 'Dark' ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-100 focus:ring-slate-200'}`} placeholder="0" />
-                          </div>
-                       </div>
-
-                       {selectedSubsidyRows.length > 0 && (
-                         <div className={`rounded-2xl border p-5 ${config.colorMode === 'Dark' ? 'border-amber-900/50 bg-amber-950/20' : 'border-amber-100 bg-amber-50/60'}`}>
-                           <div className="flex items-start justify-between gap-4">
-                             <div>
-                               <p className={`text-[10px] font-black uppercase tracking-[2px] ${config.colorMode === 'Dark' ? 'text-amber-400' : 'text-amber-700'}`}>燃油补贴 / Budi Madani</p>
-                               <p className={`mt-1 text-xs font-bold ${config.colorMode === 'Dark' ? 'text-amber-100' : 'text-amber-900'}`}>
-                                 票面总额保留在 Grand Total，客户实际支付金额单独展示，避免把政府补贴误当普通折扣。
-                               </p>
-                             </div>
-                             {selectedSubsidyPayable !== null && (
-                               <div className={`min-w-40 rounded-xl px-4 py-3 text-right ${config.colorMode === 'Dark' ? 'bg-slate-950/50' : 'bg-white'}`}>
-                                 <p className="text-[9px] font-black uppercase text-slate-400">实际支付 / OPT</p>
-                                 <p className={`text-2xl font-black ${config.colorMode === 'Dark' ? 'text-white' : 'text-slate-900'}`}>{config.currency} {selectedSubsidyPayable.toFixed(2)}</p>
-                               </div>
-                             )}
-                           </div>
-                           <div className="mt-4 grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3">
-                             {selectedSubsidyRows.map((row) => (
-                               <div key={row.label} className={`rounded-xl px-3 py-2 ${config.colorMode === 'Dark' ? 'bg-slate-950/40' : 'bg-white/80'}`}>
-                                 <p className="text-[9px] font-black uppercase text-slate-400">{row.label}</p>
-                                 <p className={`mt-0.5 truncate text-xs font-black ${config.colorMode === 'Dark' ? 'text-slate-100' : 'text-slate-800'}`}>{row.value}</p>
-                               </div>
-                             ))}
-                           </div>
-                         </div>
-                       )}
-                       
-                       <div className={`pt-6 border-t flex items-center justify-between ${config.colorMode === 'Dark' ? 'border-slate-800' : 'border-slate-100'}`}>
-                          <div>
-                             <p className="text-[10px] font-black text-slate-400 uppercase mb-0.5">{t.calculatedTotal}</p>
-                             <div className="flex items-center gap-4">
-                               <p className={`text-3xl font-black tracking-tight ${Math.abs(manualTotal - selectedReceipt.grand_total) < 0.05 ? config.theme.text : 'text-rose-600'}`}>
-                                  {config.currency} {manualTotal.toFixed(2)}
-                               </p>
-                               {Math.abs(manualTotal - selectedReceipt.grand_total) > 0.05 ? (
-                                  <span className="px-3 py-1.5 bg-rose-50 text-rose-600 text-[10px] font-black uppercase rounded-lg border border-rose-100 flex items-center gap-1 animate-pulse">
-                                    <AlertTriangle className="w-4 h-4" /> {t.mathFailed} {config.currency} {(manualTotal - selectedReceipt.grand_total).toFixed(2)}
-                                  </span>
-                               ) : (
-                                  <span className={`px-3 py-1.5 text-[10px] font-black uppercase rounded-lg border flex items-center gap-1 ${config.colorMode === 'Dark' ? 'bg-emerald-950 text-emerald-400 border-emerald-900/50' : 'bg-emerald-50 text-emerald-600 border-emerald-100'}`}>
-                                    <CheckCircle className="w-4 h-4" /> {t.mathPassed}
-                                  </span>
-                               )}
-                             </div>
-                             <p className="text-[9px] font-bold text-slate-400 mt-1 uppercase tracking-widest">{t.ocrTotal}: {config.currency} {selectedReceipt.grand_total}</p>
-                          </div>
-                          
-                          <div className="flex items-center gap-3">
-                             <button onClick={() => setSelectedReceipt(null)} className={`px-6 py-4 rounded-2xl font-black uppercase tracking-widest text-[10px] transition-all ${config.colorMode === 'Dark' ? 'bg-slate-800 text-slate-400 hover:bg-slate-700' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
-                                {t.keepPending}
-                             </button>
-                             <button 
-                                onClick={async () => { 
-                                  const updated = { ...selectedReceipt, status: 'Synced' };
-                                  setHistory(history.map(h => h.id === selectedReceipt.id ? updated : h)); 
-                                  await syncToDatabase(updated);
-                                  setSelectedReceipt(null); 
-                                }} 
-                                className={`px-8 py-4 ${config.theme.color} text-white rounded-2xl font-black uppercase tracking-widest text-xs shadow-lg hover:brightness-110 transition-all flex items-center justify-center gap-2 active:scale-95`}
-                             >
-                                <Save className="w-4 h-4" /> {t.syncToSheets}
-                             </button>
-                          </div>
-                       </div>
-                    </div>
-                 </div>
-
-              </div>
-           </div>
-        </div>
+        <ReceiptReviewDrawer
+          receipt={selectedReceipt}
+          config={config}
+          labels={t}
+          documentTypeOptions={documentTypeOptions}
+          industries={INDUSTRIES}
+          tagOptions={TAGS_OPTIONS}
+          activeRepairProgress={activeRepairProgress}
+          isExporting={isExporting}
+          isSmartParsing={smartParsingReceiptId === selectedReceipt.id}
+          isFieldVisible={isAuditFieldVisible}
+          onReceiptChange={setSelectedReceipt}
+          onClose={() => setSelectedReceipt(null)}
+          onSmartParse={handleSmartParse}
+          onExport={() => handleExport(selectedReceipt)}
+          onRestore={() => handleRestoreDeleted(selectedReceipt.id)}
+          onPermanentDelete={() => handlePermanentDelete(selectedReceipt.id)}
+          onSync={handleSyncSelectedReceipt}
+          onSaveCustomDocType={handleSaveCustomDocType}
+          onZoomImage={setZoomImage}
+        />
       )}
-
       {/* Settings Modal - Safety Preserved */}
       {isSettingsOpen && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-slate-900/60 backdrop-blur-sm animate-in fade-in">
-           <div className={`w-full max-w-md rounded-[32px] shadow-2xl p-8 space-y-6 transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-900 text-white border border-slate-800' : 'bg-white text-slate-900'}`}>
-              <div className={`flex justify-between items-center border-b pb-4 ${config.colorMode === 'Dark' ? 'border-slate-800' : 'border-slate-50'}`}>
-                 <h3 className="text-xl font-black flex items-center gap-2">
-                   <Settings className="w-5 h-5" /> {t.systemPref}
-                 </h3>
-                 <button onClick={() => setIsSettingsOpen(false)} className={`p-2 rounded-full transition-all ${config.colorMode === 'Dark' ? 'hover:bg-slate-800 text-slate-400' : 'hover:bg-slate-100 text-slate-400'}`}>
-                   <X className="w-5 h-5" />
-                 </button>
-              </div>
-
-              <div className="space-y-6">
-                 {/* 语言配置 */}
-                 <div className="space-y-3">
-                    <label className={`text-[10px] font-black uppercase tracking-[2px] flex items-center gap-2 ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>
-                       <Languages className="w-3.5 h-3.5" /> {t.languagePref}
-                    </label>
-                    <div className="grid grid-cols-2 gap-2">
-                       {[{ id: 'zh', name: '中文' }, { id: 'en', name: 'English' }, { id: 'ms', name: 'Melayu' }].map(lang => (
-                          <button 
-                            key={lang.id}
-                            onClick={() => setConfig({...config, language: lang.id})}
-                            className={`px-4 py-3 rounded-xl text-xs font-black transition-all border ${
-                              config.language === lang.id 
-                                ? `${config.theme.color} text-white border-transparent shadow-lg` 
-                                : config.colorMode === 'Dark' 
-                                  ? 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700' 
-                                  : 'bg-slate-50 border-slate-100 text-slate-600 hover:bg-white hover:shadow-sm'
-                            }`}
-                          >
-                             {lang.name}
-                          </button>
-                       ))}
-                    </div>
-                 </div>
-
-                 {/* 系统颜色深浅 */}
-                 <div className="space-y-3">
-                    <label className={`text-[10px] font-black uppercase tracking-[2px] flex items-center gap-2 ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>
-                       <Sun className="w-3.5 h-3.5" /> {t.themeMode}
-                    </label>
-                    <div className="flex p-1 bg-slate-100 dark:bg-slate-800 rounded-2xl gap-1">
-                       <button 
-                          onClick={() => setConfig({...config, colorMode: 'Light'})}
-                          className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-black transition-all ${config.colorMode === 'Light' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-500 hover:text-slate-700'}`}
-                       >
-                          <Sun className="w-4 h-4" /> {t.lightMode}
-                       </button>
-                       <button 
-                          onClick={() => setConfig({...config, colorMode: 'Dark'})}
-                          className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-black transition-all ${config.colorMode === 'Dark' ? 'bg-slate-700 shadow-sm text-white' : 'text-slate-500 hover:text-slate-300'}`}
-                       >
-                          <Moon className="w-4 h-4" /> {t.darkMode}
-                       </button>
-                    </div>
-                 </div>
-
-                 {/* 货币设置 */}
-                 <div className="space-y-3">
-                    <label className={`text-[10px] font-black uppercase tracking-[2px] flex items-center gap-2 ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>
-                       <Banknote className="w-3.5 h-3.5" /> {t.currencyPref}
-                    </label>
-                    <div className="grid grid-cols-3 gap-2">
-                       {['RM', 'USD', 'CNY'].map(cur => (
-                          <button 
-                            key={cur}
-                            onClick={() => setConfig({...config, currency: cur})}
-                            className={`px-4 py-3 rounded-xl text-xs font-black transition-all border ${
-                              config.currency === cur 
-                                ? `${config.theme.color} text-white border-transparent shadow-lg` 
-                                : config.colorMode === 'Dark' 
-                                  ? 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700' 
-                                  : 'bg-slate-50 border-slate-100 text-slate-600 hover:bg-white hover:shadow-sm'
-                            }`}
-                          >
-                             {cur}
-                          </button>
-                       ))}
-                    </div>
-                 </div>
-
-                 {/* 主题色选择 */}
-                 <div>
-                    <label className={`text-[10px] font-black uppercase tracking-[2px] block mb-3 ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>{t.brandColor}</label>
-                    <div className="flex gap-4">
-                       {THEMES.map(t_color => (
-                          <button 
-                            key={t_color.name} 
-                            onClick={() => setConfig({...config, theme: t_color})} 
-                            className={`w-10 h-10 rounded-2xl ${t_color.color} flex items-center justify-center transition-all ${config.theme.name === t_color.name ? 'scale-110 ring-4 ring-offset-4 ' + (config.colorMode === 'Dark' ? 'ring-slate-700 ring-offset-slate-900' : 'ring-slate-200 ring-offset-white') : 'opacity-40 hover:opacity-100'}`}
-                          >
-                            {config.theme.name === t_color.name && <CheckCircle className="w-5 h-5 text-white" />}
-                          </button>
-                       ))}
-                    </div>
-                 </div>
-
-
-              </div>
-
-              <div className="pt-2">
-                <button 
-                  onClick={() => setIsSettingsOpen(false)}
-                  className={`w-full py-4 ${config.theme.color} text-white rounded-2xl font-black uppercase tracking-widest text-xs shadow-lg hover:brightness-110 transition-all`}
-                >
-                  {t.saveAndApply}
-                </button>
-              </div>
-           </div>
-        </div>
+        <SettingsModal
+          config={config}
+          labels={t}
+          themes={THEMES}
+          fieldPreferences={fieldPreferences}
+          onConfigChange={setConfig}
+          onFieldPreferencesChange={handleSaveFieldPreferences}
+          onClose={() => setIsSettingsOpen(false)}
+        />
       )}
 
       {/* 全屏图片放大预览模态框 */}
@@ -1901,6 +1614,6 @@ export default function App() {
            />
         </div>
       )}
-    </div>
+    </AppShell>
   );
 }

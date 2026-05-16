@@ -13,6 +13,7 @@ export interface ImageProcessingMetadata {
   original_height: number
   output_width: number
   output_height: number
+  perceptual_hash?: string
 }
 
 export interface ProcessedReceiptImage {

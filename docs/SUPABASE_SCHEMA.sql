@@ -11,8 +11,11 @@ create table if not exists public.receipts (
   file_path text,
   processed_file_path text,
   image_processing jsonb,
+  file_hash text,
   status text not null default 'uploaded'
     check (status in ('uploaded', 'processing', 'pending_review', 'synced', 'failed')),
+  processing_stage text
+    check (processing_stage is null or processing_stage in ('uploaded', 'ocr_scanning', 'ai_extracting', 'generating_preview', 'ready_for_review', 'ocr_failed')),
   merchant_name text,
   company_reg_no text,
   address text,
@@ -23,7 +26,8 @@ create table if not exists public.receipts (
   category text not null default 'Other'
     check (category in ('Grocery', 'Fuel', 'F&B', 'Retail', 'Service', 'Other')),
   doc_type text not null default 'Receipt'
-    check (doc_type in ('Receipt', 'Invoice', 'Credit Note', 'Expense')),
+    check (doc_type in ('Receipt', 'Invoice', 'Credit Note', 'Expense', 'E-invoice')),
+  custom_doc_type text,
   subtotal numeric(10,2) not null default 0,
   discount numeric(10,2) not null default 0,
   tax numeric(10,2) not null default 0,
@@ -33,12 +37,19 @@ create table if not exists public.receipts (
   payment_method text,
   change numeric(10,2) not null default 0,
   subsidy_details jsonb,
+  extra_fields jsonb,
   tags text[] not null default '{}',
   confidence_score numeric(4,3) not null default 0,
+  warnings jsonb not null default '[]'::jsonb,
+  duplicate_of uuid references public.receipts(id) on delete set null,
+  duplicate_score numeric(4,3),
   raw_ocr text,
   raw_ai jsonb,
   error_message text,
   processed_at timestamptz,
+  deleted_at timestamptz,
+  deleted_reason text,
+  deleted_note text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -60,17 +71,31 @@ create table if not exists public.receipt_items (
 create index if not exists idx_receipts_user_status_created
   on public.receipts (user_id, status, created_at desc);
 
+create index if not exists idx_receipts_user_not_deleted_created
+  on public.receipts (user_id, created_at desc)
+  where deleted_at is null;
+
 create index if not exists idx_receipts_user_date
   on public.receipts (user_id, date desc);
 
 create index if not exists idx_receipts_user_doc_type
   on public.receipts (user_id, doc_type);
 
+create index if not exists idx_receipts_user_file_hash
+  on public.receipts (user_id, file_hash)
+  where file_hash is not null;
+
+create index if not exists idx_receipts_duplicate_of
+  on public.receipts (duplicate_of)
+  where duplicate_of is not null;
+
 create index if not exists idx_receipts_tags
   on public.receipts using gin (tags);
 
 create index if not exists idx_receipt_items_receipt_id
   on public.receipt_items (receipt_id, sort_order);
+create index if not exists idx_receipt_items_user_id
+  on public.receipt_items (user_id);
 
 create table if not exists public.ocr_usage_monthly (
   user_id uuid not null references auth.users(id) on delete cascade,
@@ -81,49 +106,121 @@ create table if not exists public.ocr_usage_monthly (
   primary key (user_id, period, provider)
 );
 
+create table if not exists public.custom_document_types (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  name text not null,
+  created_at timestamptz not null default now(),
+  unique(user_id, name)
+);
+
+create table if not exists public.user_field_preferences (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  field_key text not null,
+  enabled boolean not null default true,
+  export_enabled boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(user_id, field_key)
+);
+
 create index if not exists idx_ocr_usage_monthly_provider_period
   on public.ocr_usage_monthly (provider, period);
 
 alter table public.receipts enable row level security;
 alter table public.receipt_items enable row level security;
 alter table public.ocr_usage_monthly enable row level security;
+alter table public.custom_document_types enable row level security;
+alter table public.user_field_preferences enable row level security;
 
 create policy "Users can read own receipts"
   on public.receipts for select
+  to authenticated
   using ((select auth.uid()) = user_id);
 
 create policy "Users can insert own receipts"
   on public.receipts for insert
+  to authenticated
   with check ((select auth.uid()) = user_id);
 
 create policy "Users can update own receipts"
   on public.receipts for update
+  to authenticated
   using ((select auth.uid()) = user_id)
   with check ((select auth.uid()) = user_id);
 
 create policy "Users can delete own receipts"
   on public.receipts for delete
+  to authenticated
   using ((select auth.uid()) = user_id);
 
 create policy "Users can read own receipt items"
   on public.receipt_items for select
+  to authenticated
   using ((select auth.uid()) = user_id);
 
 create policy "Users can insert own receipt items"
   on public.receipt_items for insert
+  to authenticated
   with check ((select auth.uid()) = user_id);
 
 create policy "Users can update own receipt items"
   on public.receipt_items for update
+  to authenticated
   using ((select auth.uid()) = user_id)
   with check ((select auth.uid()) = user_id);
 
 create policy "Users can delete own receipt items"
   on public.receipt_items for delete
+  to authenticated
   using ((select auth.uid()) = user_id);
 
 create policy "Users can read own OCR usage"
   on public.ocr_usage_monthly for select
+  to authenticated
+  using ((select auth.uid()) = user_id);
+
+create policy "Users can read own custom document types"
+  on public.custom_document_types for select
+  to authenticated
+  using ((select auth.uid()) = user_id);
+
+create policy "Users can insert own custom document types"
+  on public.custom_document_types for insert
+  to authenticated
+  with check ((select auth.uid()) = user_id);
+
+create policy "Users can update own custom document types"
+  on public.custom_document_types for update
+  to authenticated
+  using ((select auth.uid()) = user_id)
+  with check ((select auth.uid()) = user_id);
+
+create policy "Users can delete own custom document types"
+  on public.custom_document_types for delete
+  to authenticated
+  using ((select auth.uid()) = user_id);
+
+create policy "Users can read own field preferences"
+  on public.user_field_preferences for select
+  to authenticated
+  using ((select auth.uid()) = user_id);
+
+create policy "Users can insert own field preferences"
+  on public.user_field_preferences for insert
+  to authenticated
+  with check ((select auth.uid()) = user_id);
+
+create policy "Users can update own field preferences"
+  on public.user_field_preferences for update
+  to authenticated
+  using ((select auth.uid()) = user_id)
+  with check ((select auth.uid()) = user_id);
+
+create policy "Users can delete own field preferences"
+  on public.user_field_preferences for delete
+  to authenticated
   using ((select auth.uid()) = user_id);
 
 create or replace function public.consume_ocr_quota(
@@ -184,6 +281,7 @@ grant execute on function public.consume_ocr_quota(uuid, text, text, integer, in
 create or replace function public.set_updated_at()
 returns trigger
 language plpgsql
+set search_path = public
 as $$
 begin
   new.updated_at = now();
@@ -201,6 +299,11 @@ create trigger receipt_items_set_updated_at
   before update on public.receipt_items
   for each row execute function public.set_updated_at();
 
+drop trigger if exists user_field_preferences_set_updated_at on public.user_field_preferences;
+create trigger user_field_preferences_set_updated_at
+  before update on public.user_field_preferences
+  for each row execute function public.set_updated_at();
+
 -- Storage bucket should be created in Supabase Dashboard or via storage API:
 -- bucket: receipts
 -- public: false
@@ -214,6 +317,7 @@ on conflict (id) do update set public = false;
 
 create policy "Users can read own receipt files"
   on storage.objects for select
+  to authenticated
   using (
     bucket_id = 'receipts'
     and (select auth.uid())::text = (storage.foldername(name))[1]
@@ -221,6 +325,7 @@ create policy "Users can read own receipt files"
 
 create policy "Users can upload own receipt files"
   on storage.objects for insert
+  to authenticated
   with check (
     bucket_id = 'receipts'
     and (select auth.uid())::text = (storage.foldername(name))[1]
@@ -228,6 +333,7 @@ create policy "Users can upload own receipt files"
 
 create policy "Users can update own receipt files"
   on storage.objects for update
+  to authenticated
   using (
     bucket_id = 'receipts'
     and (select auth.uid())::text = (storage.foldername(name))[1]
@@ -239,6 +345,7 @@ create policy "Users can update own receipt files"
 
 create policy "Users can delete own receipt files"
   on storage.objects for delete
+  to authenticated
   using (
     bucket_id = 'receipts'
     and (select auth.uid())::text = (storage.foldername(name))[1]

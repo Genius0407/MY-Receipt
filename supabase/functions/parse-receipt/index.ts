@@ -2,9 +2,10 @@ import { serve } from 'https://deno.land/std@0.224.0/http/server.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1'
 import { corsHeaders } from './cors.ts'
 import { buildImageUserPrompt, buildTextRepairPrompt, buildVisionPolishPrompt, SYSTEM_PROMPT } from './prompt.ts'
+import type { ReceiptPromptOptions } from './prompt.ts'
 
 const validCategories = ['Grocery', 'Fuel', 'F&B', 'Retail', 'Service', 'Other']
-const validDocTypes = ['Receipt', 'Invoice', 'Credit Note', 'Expense']
+const validDocTypes = ['Receipt', 'Invoice', 'Credit Note', 'Expense', 'E-invoice']
 const validTags = ['Business', 'Personal', 'Tax Deductible', 'Pending']
 
 serve(async (req) => {
@@ -15,6 +16,9 @@ serve(async (req) => {
   let receiptId: string | null = null
   let parseMode = 'ocr'
   let previousStatus: string | null = null
+  let enabledFields: string[] | null = null
+  let requestedDocType: string | null = null
+  let qrPayload: string | null = null
 
   try {
     assertEnv('SUPABASE_URL')
@@ -32,6 +36,9 @@ serve(async (req) => {
       return json({ error: 'receipt_id is required' }, 400)
     }
     parseMode = typeof body.mode === 'string' ? body.mode : 'ocr'
+    enabledFields = Array.isArray(body.enabled_fields) ? body.enabled_fields.filter((field: unknown) => typeof field === 'string') : null
+    requestedDocType = typeof body.doc_type === 'string' ? body.doc_type : null
+    qrPayload = typeof body.qr_payload === 'string' && body.qr_payload.trim() ? body.qr_payload.trim() : null
 
     const userClient = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_ANON_KEY')!, {
       global: { headers: { Authorization: authHeader } },
@@ -48,7 +55,7 @@ serve(async (req) => {
 
     const { data: receipt, error: receiptError } = await serviceClient
       .from('receipts')
-      .select('id,user_id,file_path,processed_file_path,mime_type,filename,image_processing,status,raw_ocr,raw_ai')
+      .select('id,user_id,file_path,processed_file_path,mime_type,filename,image_processing,file_hash,status,raw_ocr,raw_ai,doc_type,extra_fields')
       .eq('id', receiptId)
       .eq('user_id', user.id)
       .single()
@@ -62,23 +69,45 @@ serve(async (req) => {
     }
     previousStatus = receipt.status || null
 
-    await updateReceipt(serviceClient, receiptId, { status: 'processing', error_message: null })
+    await updateReceipt(serviceClient, receiptId, { status: 'processing', processing_stage: 'ocr_scanning', error_message: null })
 
     const ocrProvider = Deno.env.get('OCR_PROVIDER')?.toLowerCase()
     const useOpenAIVision = Deno.env.get('USE_OPENAI_VISION') === 'true'
+    const storedQrPayload = receipt.extra_fields && typeof receipt.extra_fields === 'object'
+      ? stringOrNull((receipt.extra_fields as Record<string, unknown>).qr_payload)
+      : null
+    const effectiveQrPayload = qrPayload ?? storedQrPayload
+    const parseOptions: ReceiptPromptOptions = {
+      enabledFields,
+      qrPayload: effectiveQrPayload,
+      schemaProfile: requestedDocType === 'E-invoice' || receipt.doc_type === 'E-invoice' || looksLikeEInvoiceQrPayload(effectiveQrPayload) ? 'einvoice' : 'standard',
+    }
+
+    await updateReceipt(serviceClient, receiptId, { processing_stage: 'ai_extracting' })
+
     const { aiJson, rawOcr } = parseMode === 'smart'
-      ? await parseWithVisionModel(serviceClient, receipt, { forceDeepSeek: true })
+      ? await parseWithVisionModel(serviceClient, receipt, { forceDeepSeek: true, ...parseOptions })
       : parseMode === 'vision'
-      ? await parseWithVisionModel(serviceClient, receipt)
+      ? await parseWithVisionModel(serviceClient, receipt, parseOptions)
       : parseMode === 'repair'
-        ? await parseWithDeepSeekRepairMode(serviceClient, receipt)
+        ? await parseWithDeepSeekRepairMode(serviceClient, receipt, parseOptions)
       : ocrProvider === 'tencent'
-      ? await parseWithTencentOCR(serviceClient, receipt)
+      ? await parseWithTencentOCR(serviceClient, receipt, parseOptions)
       : useOpenAIVision
-        ? await parseWithOpenAIVision(serviceClient, receipt)
+        ? await parseWithOpenAIVision(serviceClient, receipt, parseOptions)
         : parseManualDraft(receipt.filename)
+    await updateReceipt(serviceClient, receiptId, { processing_stage: 'generating_preview' })
+
     const normalizedReceipt = normalizeReceipt(aiJson)
+    mergeQrPayload(normalizedReceipt, receipt, effectiveQrPayload)
     const normalizedItems = normalizeItems(aiJson.items)
+    const duplicatePatch = await findDuplicatePatch(serviceClient, receipt, normalizedReceipt)
+    const warnings = buildWarnings(normalizedReceipt, normalizedItems, {
+      duplicateOf: duplicatePatch.duplicate_of,
+      duplicateScore: duplicatePatch.duplicate_score,
+      imageProcessing: receipt.image_processing,
+      rawAi: aiJson,
+    })
 
     await serviceClient.from('receipt_items').delete().eq('receipt_id', receiptId)
 
@@ -100,7 +129,10 @@ serve(async (req) => {
         ...normalizedReceipt,
         raw_ocr: rawOcr,
         raw_ai: aiJson,
+        warnings,
+        ...duplicatePatch,
         status: 'pending_review',
+        processing_stage: 'ready_for_review',
         error_message: null,
         processed_at: new Date().toISOString(),
       })
@@ -121,7 +153,13 @@ serve(async (req) => {
         const recoverableStatus = previousStatus && previousStatus !== 'processing' ? previousStatus : 'pending_review'
         await updateReceipt(serviceClient, receiptId, {
           status: parseMode === 'vision' || parseMode === 'smart' ? recoverableStatus : 'failed',
+          processing_stage: 'ocr_failed',
           error_message: message,
+          warnings: [{
+            code: 'ocr_failed',
+            severity: 'error',
+            message,
+          }],
         })
       } catch (updateError) {
         console.error('Failed to record parse error:', updateError)
@@ -132,7 +170,7 @@ serve(async (req) => {
   }
 })
 
-async function parseWithTencentOCR(client: any, receipt: any): Promise<{ aiJson: Record<string, any>; rawOcr: string }> {
+async function parseWithTencentOCR(client: any, receipt: any, options: ReceiptPromptOptions = {}): Promise<{ aiJson: Record<string, any>; rawOcr: string }> {
   assertEnv('TENCENT_SECRET_ID')
   assertEnv('TENCENT_SECRET_KEY')
 
@@ -176,11 +214,11 @@ async function parseWithTencentOCR(client: any, receipt: any): Promise<{ aiJson:
     image_processing: receipt.image_processing ?? null,
   })
 
-  const repaired = await maybeRepairWithDeepSeek(client, receipt, rawOcr, aiJson)
+  const repaired = await maybeRepairWithDeepSeek(client, receipt, rawOcr, aiJson, options)
   return { aiJson: repaired, rawOcr }
 }
 
-async function parseWithDeepSeekRepairMode(client: any, receipt: any): Promise<{ aiJson: Record<string, any>; rawOcr: string }> {
+async function parseWithDeepSeekRepairMode(client: any, receipt: any, options: ReceiptPromptOptions = {}): Promise<{ aiJson: Record<string, any>; rawOcr: string }> {
   if (!receipt.raw_ocr) {
     throw new Error('No OCR text is available for DeepSeek text repair. Re-upload or run OCR first.')
   }
@@ -194,7 +232,7 @@ async function parseWithDeepSeekRepairMode(client: any, receipt: any): Promise<{
       provider: 'existing_raw_ocr',
       average_confidence: 0.5,
     })
-  const repaired = await runDeepSeekRepairWithQuota(client, receipt, receipt.raw_ocr, initialJson)
+  const repaired = await runDeepSeekRepairWithQuota(client, receipt, receipt.raw_ocr, initialJson, options)
   return { aiJson: repaired, rawOcr: receipt.raw_ocr }
 }
 
@@ -203,6 +241,7 @@ async function maybeRepairWithDeepSeek(
   receipt: any,
   rawOcr: string,
   initialAiJson: Record<string, any>,
+  options: ReceiptPromptOptions = {},
 ): Promise<Record<string, any>> {
   const provider = Deno.env.get('AI_REPAIR_PROVIDER')?.toLowerCase()
   if (provider !== 'deepseek') return initialAiJson
@@ -211,7 +250,7 @@ async function maybeRepairWithDeepSeek(
     return appendParserNote(initialAiJson, 'DeepSeek text repair was enabled but DEEPSEEK_API_KEY is missing; skipped repair.')
   }
 
-  return runDeepSeekRepairWithQuota(client, receipt, rawOcr, initialAiJson)
+  return runDeepSeekRepairWithQuota(client, receipt, rawOcr, initialAiJson, options)
 }
 
 async function runDeepSeekRepairWithQuota(
@@ -219,6 +258,7 @@ async function runDeepSeekRepairWithQuota(
   receipt: any,
   rawOcr: string,
   initialAiJson: Record<string, any>,
+  options: ReceiptPromptOptions = {},
 ): Promise<Record<string, any>> {
   const monthlyLimit = normalizeLimit(Deno.env.get('DEEPSEEK_MONTHLY_LIMIT'), 500)
   const period = new Date().toISOString().slice(0, 7)
@@ -239,7 +279,7 @@ async function runDeepSeekRepairWithQuota(
   }
 
   try {
-    const repaired = applyItemQualityGate(rawOcr, initialAiJson, await runDeepSeekTextRepair(rawOcr, initialAiJson))
+    const repaired = applyItemQualityGate(rawOcr, initialAiJson, await runDeepSeekTextRepair(rawOcr, initialAiJson, options))
     repaired.parser_meta = {
       ...(repaired.parser_meta ?? {}),
       provider: 'deepseek_v4_text_repair',
@@ -262,7 +302,7 @@ async function runDeepSeekRepairWithQuota(
 async function parseWithVisionModel(
   client: any,
   receipt: any,
-  options: { forceDeepSeek?: boolean } = {},
+  options: ReceiptPromptOptions & { forceDeepSeek?: boolean } = {},
 ): Promise<{ aiJson: Record<string, any>; rawOcr: string }> {
   const provider = Deno.env.get('VISION_PROVIDER')?.toLowerCase() || 'qwen'
   if (provider !== 'qwen') {
@@ -290,7 +330,7 @@ async function parseWithVisionModel(
 
   const { fileBlob, mimeType, sourcePath } = await downloadReceiptImage(client, receipt)
   const base64File = await blobToBase64(fileBlob)
-  let aiJson = await runQwenVision(base64File, mimeType)
+  let aiJson = await runQwenVision(base64File, mimeType, options)
   aiJson.parser_meta = {
     ...(aiJson.parser_meta ?? {}),
     provider: 'qwen_vl',
@@ -315,7 +355,7 @@ async function maybePolishVisionWithDeepSeek(
   client: any,
   receipt: any,
   visionJson: Record<string, any>,
-  options: { forceDeepSeek?: boolean } = {},
+  options: ReceiptPromptOptions & { forceDeepSeek?: boolean } = {},
 ): Promise<Record<string, any>> {
   const provider = (Deno.env.get('VISION_REPAIR_PROVIDER') || Deno.env.get('AI_REPAIR_PROVIDER'))?.toLowerCase()
   if (!options.forceDeepSeek && provider !== 'deepseek') return visionJson
@@ -345,7 +385,7 @@ async function maybePolishVisionWithDeepSeek(
   }
 
   try {
-    const polished = await runDeepSeekVisionPolish(visionJson)
+    const polished = await runDeepSeekVisionPolish(visionJson, options)
     polished.parser_meta = {
       ...(polished.parser_meta ?? {}),
       provider: 'qwen_vl_deepseek_polish',
@@ -365,13 +405,13 @@ async function maybePolishVisionWithDeepSeek(
   }
 }
 
-async function parseWithOpenAIVision(client: any, receipt: any): Promise<{ aiJson: Record<string, any>; rawOcr: string }> {
+async function parseWithOpenAIVision(client: any, receipt: any, options: ReceiptPromptOptions = {}): Promise<{ aiJson: Record<string, any>; rawOcr: string }> {
   assertEnv('OPENAI_API_KEY')
 
   const { fileBlob, mimeType, sourcePath } = await downloadReceiptImage(client, receipt)
 
   const base64File = await blobToBase64(fileBlob)
-  const aiJson = await runOpenAIVision(base64File, mimeType)
+  const aiJson = await runOpenAIVision(base64File, mimeType, options)
   aiJson.parser_meta = {
     ...(aiJson.parser_meta ?? {}),
     image_source: sourcePath === receipt.processed_file_path ? 'processed' : 'original',
@@ -522,7 +562,7 @@ async function callTencentCloudApi(action: string, version: string, payload: str
   })
 }
 
-async function runOpenAIVision(base64File: string, mimeType: string): Promise<Record<string, any>> {
+async function runOpenAIVision(base64File: string, mimeType: string, options: ReceiptPromptOptions = {}): Promise<Record<string, any>> {
   if (!['image/jpeg', 'image/png'].includes(mimeType)) {
     throw new Error('OpenAI vision fallback currently supports JPEG and PNG receipts only.')
   }
@@ -542,7 +582,7 @@ async function runOpenAIVision(base64File: string, mimeType: string): Promise<Re
         {
           role: 'user',
           content: [
-            { type: 'text', text: buildImageUserPrompt() },
+            { type: 'text', text: buildImageUserPrompt(options) },
             {
               type: 'image_url',
               image_url: {
@@ -566,7 +606,7 @@ async function runOpenAIVision(base64File: string, mimeType: string): Promise<Re
   return parseJsonObject(content)
 }
 
-async function runQwenVision(base64File: string, mimeType: string): Promise<Record<string, any>> {
+async function runQwenVision(base64File: string, mimeType: string, options: ReceiptPromptOptions = {}): Promise<Record<string, any>> {
   if (!['image/jpeg', 'image/png'].includes(mimeType)) {
     throw new Error('Qwen vision reparse currently supports JPEG and PNG receipts only.')
   }
@@ -590,7 +630,7 @@ async function runQwenVision(base64File: string, mimeType: string): Promise<Reco
             role: 'user',
             content: [
               { image: `data:${mimeType};base64,${base64File}` },
-              { text: buildImageUserPrompt() },
+              { text: buildImageUserPrompt(options) },
             ],
           },
         ],
@@ -624,7 +664,7 @@ function extractQwenTextContent(payload: Record<string, any>): string | null {
   return null
 }
 
-async function runDeepSeekTextRepair(rawOcr: string, initialAiJson: Record<string, any>): Promise<Record<string, any>> {
+async function runDeepSeekTextRepair(rawOcr: string, initialAiJson: Record<string, any>, options: ReceiptPromptOptions = {}): Promise<Record<string, any>> {
   const baseUrl = Deno.env.get('DEEPSEEK_BASE_URL') || 'https://api.deepseek.com'
   const endpoint = `${baseUrl.replace(/\/$/, '')}/chat/completions`
   const response = await fetch(endpoint, {
@@ -641,7 +681,7 @@ async function runDeepSeekTextRepair(rawOcr: string, initialAiJson: Record<strin
         { role: 'system', content: SYSTEM_PROMPT },
         {
           role: 'user',
-          content: buildTextRepairPrompt(rawOcr, initialAiJson),
+          content: buildTextRepairPrompt(rawOcr, initialAiJson, options),
         },
       ],
     }),
@@ -657,7 +697,7 @@ async function runDeepSeekTextRepair(rawOcr: string, initialAiJson: Record<strin
   return parseJsonObject(content)
 }
 
-async function runDeepSeekVisionPolish(visionJson: Record<string, any>): Promise<Record<string, any>> {
+async function runDeepSeekVisionPolish(visionJson: Record<string, any>, options: ReceiptPromptOptions = {}): Promise<Record<string, any>> {
   const baseUrl = Deno.env.get('DEEPSEEK_BASE_URL') || 'https://api.deepseek.com'
   const endpoint = `${baseUrl.replace(/\/$/, '')}/chat/completions`
   const response = await fetch(endpoint, {
@@ -674,7 +714,7 @@ async function runDeepSeekVisionPolish(visionJson: Record<string, any>): Promise
         { role: 'system', content: SYSTEM_PROMPT },
         {
           role: 'user',
-          content: buildVisionPolishPrompt(visionJson),
+          content: buildVisionPolishPrompt(visionJson, options),
         },
       ],
     }),
@@ -1056,6 +1096,7 @@ function normalizeReceipt(input: Record<string, any>) {
     time: stringOrNull(input.time),
     category,
     doc_type: docType,
+    custom_doc_type: stringOrNull(input.custom_doc_type),
     subtotal: normalizeMoney(input.subtotal),
     discount: normalizeMoney(input.discount),
     tax: normalizeMoney(input.tax),
@@ -1065,9 +1106,60 @@ function normalizeReceipt(input: Record<string, any>) {
     payment_method: stringOrNull(input.payment_method),
     change: normalizeMoney(input.change),
     subsidy_details: input.subsidy_details && typeof input.subsidy_details === 'object' ? input.subsidy_details : null,
+    extra_fields: input.extra_fields && typeof input.extra_fields === 'object' ? normalizeExtraFields(input.extra_fields as Record<string, unknown>) : null,
     tags,
     confidence_score: clamp(Number(input.confidence_score) || 0, 0, 1),
   }
+}
+
+function mergeQrPayload(normalizedReceipt: Record<string, any>, receipt: Record<string, any>, qrPayload: string | null) {
+  const normalizedExtraFields = normalizedReceipt.extra_fields && typeof normalizedReceipt.extra_fields === 'object'
+    ? normalizedReceipt.extra_fields as Record<string, unknown>
+    : {}
+  const storedExtraFields = receipt.extra_fields && typeof receipt.extra_fields === 'object'
+    ? receipt.extra_fields as Record<string, unknown>
+    : {}
+  const payload = qrPayload
+    ?? stringOrNull(normalizedExtraFields.qr_payload)
+    ?? stringOrNull(storedExtraFields.qr_payload)
+
+  if (!payload) return
+
+  normalizedReceipt.extra_fields = {
+    ...normalizedExtraFields,
+    qr_payload: payload,
+  }
+
+  if (looksLikeEInvoiceQrPayload(payload)) {
+    normalizedReceipt.doc_type = 'E-invoice'
+  }
+}
+
+function looksLikeEInvoiceQrPayload(payload: string | null | undefined): boolean {
+  if (!payload) return false
+  return /myinvois|e-?invoice|invoice|lhdn|hasil|tax|uuid|validation/i.test(payload)
+}
+
+function normalizeExtraFields(input: Record<string, unknown>) {
+  const extraFields: Record<string, unknown> = {}
+  const stringKeys = [
+    'supplier_name',
+    'buyer_name',
+    'supplier_tin',
+    'buyer_tin',
+    'sst_no',
+    'invoice_uuid',
+    'validation_link',
+    'qr_payload',
+    'invoice_type',
+  ]
+
+  for (const key of stringKeys) {
+    extraFields[key] = stringOrNull(input[key])
+  }
+
+  extraFields.tax_amount = normalizeMoney(input.tax_amount)
+  return extraFields
 }
 
 function normalizeItems(items: unknown) {
@@ -1085,6 +1177,245 @@ function normalizeItems(items: unknown) {
       }
     })
     .filter((item) => item.name.length > 0)
+}
+
+async function findDuplicatePatch(client: any, receipt: any, normalizedReceipt: Record<string, any>) {
+  const { data: candidates, error } = await client
+    .from('receipts')
+    .select('id,file_hash,merchant_name,invoice_no,date,grand_total,deleted_at,image_processing,raw_ocr')
+    .eq('user_id', receipt.user_id)
+    .neq('id', receipt.id)
+    .is('deleted_at', null)
+
+  if (error) throw error
+
+  const best = (candidates ?? [])
+    .map((candidate: Record<string, any>) => scoreDuplicate(receipt, normalizedReceipt, candidate))
+    .filter(Boolean)
+    .sort((left: any, right: any) => right.score - left.score)[0]
+
+  return best
+    ? { duplicate_of: best.id, duplicate_score: best.score }
+    : { duplicate_of: null, duplicate_score: null }
+}
+
+function scoreDuplicate(receipt: any, normalizedReceipt: Record<string, any>, candidate: Record<string, any>) {
+  let score = 0
+
+  if (receipt.file_hash && candidate.file_hash && receipt.file_hash === candidate.file_hash) {
+    score += 1
+  }
+
+  if (sameText(normalizedReceipt.invoice_no, candidate.invoice_no) && sameText(normalizedReceipt.merchant_name, candidate.merchant_name)) {
+    score += 0.8
+  }
+
+  if (
+    sameText(normalizedReceipt.merchant_name, candidate.merchant_name)
+    && sameDate(normalizedReceipt.date, candidate.date)
+    && sameAmount(normalizedReceipt.grand_total, candidate.grand_total)
+  ) {
+    score += 0.7
+  }
+
+  if (sameText(normalizedReceipt.invoice_no, candidate.invoice_no) && sameDate(normalizedReceipt.date, candidate.date)) {
+    score += 0.5
+  }
+
+  if (
+    similarText(normalizedReceipt.merchant_name, candidate.merchant_name)
+    && nearDate(normalizedReceipt.date, candidate.date)
+    && similarAmount(normalizedReceipt.grand_total, candidate.grand_total)
+  ) {
+    score += 0.45
+  }
+
+  if (tokenSimilarity(receipt.raw_ocr, candidate.raw_ocr) >= 0.72) {
+    score += 0.55
+  }
+
+  const receiptHash = readPerceptualHash(receipt)
+  const candidateHash = readPerceptualHash(candidate)
+  if (receiptHash && candidateHash && hammingDistance(receiptHash, candidateHash) <= 8) {
+    score += 0.65
+  }
+
+  const normalizedScore = Math.min(1, Math.round(score * 100) / 100)
+  return normalizedScore >= 0.5 ? { id: candidate.id, score: normalizedScore } : null
+}
+
+function buildWarnings(
+  receipt: Record<string, any>,
+  items: Array<Record<string, any>>,
+  context: {
+    duplicateOf: string | null
+    duplicateScore: number | null
+    imageProcessing: Record<string, unknown> | null
+    rawAi: Record<string, unknown>
+  },
+) {
+  const warnings: Array<Record<string, unknown>> = []
+  const requiredFields = [
+    ['merchant_name', 'Merchant is missing'],
+    ['invoice_no', 'Invoice No. is missing'],
+    ['date', 'Date is missing'],
+  ]
+
+  for (const [field, message] of requiredFields) {
+    if (!receipt[field]) {
+      warnings.push({ code: 'missing_required_field', severity: 'warning', message, field })
+    }
+  }
+
+  if (Number(receipt.confidence_score || 0) > 0 && Number(receipt.confidence_score || 0) < 0.65) {
+    warnings.push({
+      code: 'low_confidence_field',
+      severity: 'warning',
+      message: 'Low confidence extraction',
+      field: 'confidence_score',
+      details: { confidence_score: receipt.confidence_score },
+    })
+  }
+
+  const itemTotal = roundMoney(items.reduce((sum, item) => sum + Number(item.line_total || 0), 0))
+  const subtotal = roundMoney(Number(receipt.subtotal || 0))
+  const formulaTotal = roundMoney(
+    Number(receipt.subtotal || 0)
+    - Number(receipt.discount || 0)
+    + Number(receipt.tax || 0)
+    + Number(receipt.service_charge || 0)
+    + Number(receipt.rounding || 0),
+  )
+  const grandTotal = roundMoney(Number(receipt.grand_total || 0))
+
+  if (items.length > 0 && subtotal > 0 && Math.abs(itemTotal - subtotal) > 0.05) {
+    warnings.push({ code: 'total_mismatch', severity: 'warning', message: 'Line item total does not match subtotal', details: { item_total: itemTotal, subtotal } })
+  }
+
+  if (grandTotal > 0 && formulaTotal > 0 && Math.abs(formulaTotal - grandTotal) > 0.05) {
+    warnings.push({ code: 'amount_mismatch', severity: 'warning', message: 'Calculated total does not match grand total', details: { calculated_total: formulaTotal, grand_total: grandTotal } })
+  }
+
+  const imageQuality = String(context.imageProcessing?.quality ?? context.rawAi?.parser_meta?.image_quality ?? '').toLowerCase()
+  const itemQuality = String(context.rawAi?.parser_meta?.item_quality ?? '').toLowerCase()
+  if (imageQuality.includes('blur') || itemQuality === 'low') {
+    warnings.push({ code: 'blurry_image', severity: 'warning', message: 'Image or item OCR quality is low' })
+  }
+
+  if (context.duplicateOf) {
+    warnings.push({
+      code: 'possible_duplicate',
+      severity: 'warning',
+      message: 'Possible duplicate receipt',
+      details: { duplicate_of: context.duplicateOf, duplicate_score: context.duplicateScore },
+    })
+  }
+
+  return warnings
+}
+
+function sameText(left: string | null | undefined, right: string | null | undefined) {
+  return Boolean(left && right && normalizeComparableText(left) === normalizeComparableText(right))
+}
+
+function sameDate(left: string | null | undefined, right: string | null | undefined) {
+  return Boolean(left && right && String(left).slice(0, 10) === String(right).slice(0, 10))
+}
+
+function sameAmount(left: number | null | undefined, right: number | null | undefined) {
+  return Number.isFinite(Number(left)) && Number.isFinite(Number(right)) && Math.abs(Number(left) - Number(right)) <= 0.05
+}
+
+function normalizeComparableText(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, '')
+}
+
+function similarText(left: string | null | undefined, right: string | null | undefined) {
+  if (!left || !right) return false
+  const normalizedLeft = normalizeComparableText(left)
+  const normalizedRight = normalizeComparableText(right)
+  if (normalizedLeft.length < 4 || normalizedRight.length < 4) return false
+  const distance = levenshteinDistance(normalizedLeft, normalizedRight)
+  return 1 - distance / Math.max(normalizedLeft.length, normalizedRight.length) >= 0.82
+}
+
+function nearDate(left: string | null | undefined, right: string | null | undefined) {
+  if (!left || !right) return false
+  const leftTime = Date.parse(String(left).slice(0, 10))
+  const rightTime = Date.parse(String(right).slice(0, 10))
+  if (!Number.isFinite(leftTime) || !Number.isFinite(rightTime)) return false
+  return Math.abs(leftTime - rightTime) <= 3 * 24 * 60 * 60 * 1000
+}
+
+function similarAmount(left: number | null | undefined, right: number | null | undefined) {
+  const leftAmount = Number(left)
+  const rightAmount = Number(right)
+  if (!Number.isFinite(leftAmount) || !Number.isFinite(rightAmount)) return false
+  const delta = Math.abs(leftAmount - rightAmount)
+  return delta <= 1 || delta <= Math.max(leftAmount, rightAmount) * 0.02
+}
+
+function tokenSimilarity(left: string | null | undefined, right: string | null | undefined): number {
+  const leftTokens = tokenize(left)
+  const rightTokens = tokenize(right)
+  if (leftTokens.size === 0 || rightTokens.size === 0) return 0
+
+  let intersection = 0
+  leftTokens.forEach((token) => {
+    if (rightTokens.has(token)) intersection += 1
+  })
+
+  return Math.round((2 * intersection / (leftTokens.size + rightTokens.size)) * 100) / 100
+}
+
+function tokenize(value: string | null | undefined) {
+  return new Set(
+    String(value ?? '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((token) => token.length >= 3),
+  )
+}
+
+function readPerceptualHash(receipt: Record<string, any>) {
+  const imageProcessing = receipt.image_processing
+  if (!imageProcessing || typeof imageProcessing !== 'object') return null
+  const hash = imageProcessing.perceptual_hash
+  return typeof hash === 'string' && /^[01]{64}$/.test(hash) ? hash : null
+}
+
+function hammingDistance(left: string, right: string): number {
+  if (left.length !== right.length) return Number.POSITIVE_INFINITY
+  let distance = 0
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) distance += 1
+  }
+  return distance
+}
+
+function levenshteinDistance(left: string, right: string): number {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index)
+  const current = Array.from({ length: right.length + 1 }, () => 0)
+
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    current[0] = leftIndex
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      const cost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1
+      current[rightIndex] = Math.min(
+        current[rightIndex - 1] + 1,
+        previous[rightIndex] + 1,
+        previous[rightIndex - 1] + cost,
+      )
+    }
+    previous.splice(0, previous.length, ...current)
+  }
+
+  return previous[right.length]
+}
+
+function roundMoney(value: number) {
+  return Math.round(value * 100) / 100
 }
 
 async function blobToBase64(blob: Blob): Promise<string> {

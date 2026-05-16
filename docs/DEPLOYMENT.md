@@ -88,7 +88,7 @@ DeepSeek V4 默认处理腾讯 OCR 文本；当明细为空、金额校验失败
 2. Storage bucket：`receipts`。
 3. Postgres 表：`receipts`、`receipt_items`。
 4. OCR quota 表与 `consume_ocr_quota` RPC。
-5. `receipts.processed_file_path` 与 `receipts.image_processing`，用于保存上传前裁剪图和裁剪参数。
+5. `receipts.processed_file_path` 与 `receipts.image_processing`，用于保存解析前裁剪图和裁剪参数。
 6. Edge Function：`parse-receipt`。
 
 数据库和 RLS 参考 [SUPABASE_SCHEMA.sql](./SUPABASE_SCHEMA.sql)。
@@ -148,10 +148,10 @@ Edge Function: parse-receipt
 
 ```text
 {user_id}/{receipt_id}/original.ext
-{user_id}/{receipt_id}/processed.jpg
+{user_id}/{receipt_id}/processed-{timestamp}.ext
 ```
 
-前端上传文件时必须使用该路径格式。原图永远保留在 `original.ext`，上传前裁剪/旋转后的识别图保存在 `processed.jpg`。Edge Function 使用 service role 优先读取 `processed_file_path`，没有裁剪图时回退读取原图。
+前端上传文件时必须使用该路径格式。原图永远保留在 `original.ext`，审核页点击“智能解析”前裁剪/旋转后的识别图保存在唯一 `processed-{timestamp}.ext` 路径，避免覆盖旧裁剪图。Edge Function 使用 service role 优先读取 `processed_file_path`，没有裁剪图时回退读取原图。
 
 ## 9. 前端部署步骤
 
@@ -201,9 +201,9 @@ supabase functions deploy parse-receipt
 - 前端源码、Vite 配置、`.env.example` 不包含腾讯云密钥、DeepSeek key、DashScope key、OpenAI、OpenAI 开关、service role 或 Gemini key。
 - `receipts` 和 `receipt_items` 已启用 RLS。
 - `receipts` Storage bucket 为 private。
-- Storage object path 使用 `{user_id}/{receipt_id}/original.ext`，裁剪图使用 `{user_id}/{receipt_id}/processed.jpg`。
+- Storage object path 使用 `{user_id}/{receipt_id}/original.ext`，裁剪图使用 `{user_id}/{receipt_id}/processed-{timestamp}.ext`。
 - `parse-receipt` 已部署，并能通过当前用户 JWT 校验 receipt 所有权。
-- 上传一张清晰 JPG/PNG 收据后，先出现裁剪弹窗；应用裁剪后状态能从 `uploaded` 进入 `processing`，最后到 `pending_review`，并写入 `raw_ocr`。
+- 上传一张清晰 JPG/PNG 收据后，先进入列表并显示 `uploaded`；打开单据点击“智能解析”后出现裁剪弹窗，应用裁剪后状态能进入 `processing`，最后到 `pending_review`，并写入 `raw_ocr` / `raw_ai`。
 - 审核保存能写回 `receipts` 与 `receipt_items`。
 - Excel 导出能下载 `.xlsx`。
 

@@ -43,7 +43,7 @@ npm run dev
 ## 2. 项目结构详解
 
 ```
-MY-Receipt/
+ResitAI/
 │
 ├── src/                           # React 前端源码
 │   ├── App.tsx                    # 主应用组件
@@ -55,7 +55,7 @@ MY-Receipt/
 │   │   ├── supabase.ts            # Supabase 客户端单例
 │   │   └── exportExcel.ts         # ExcelJS 导出工具
 │   └── services/
-│       └── geminiService.ts       # Google Gemini API 封装（原型阶段）
+│       └── receiptApi.ts          # 浏览器侧唯一 receipt 数据入口
 │
 ├── supabase/functions/            # Edge Function 源码
 │   ├── README.md                  # 开发说明
@@ -132,7 +132,7 @@ custom_field: stringOrNull(input.custom_field),
 
 #### 步骤 E：更新导出模板
 
-在 `src/lib/export.ts` 中添加新字段到导出对象。
+在 `src/lib/exportExcel.ts` 中添加新字段到 `Receipts` sheet；明细字段放入 `Items` sheet。
 
 #### 步骤 F：更新前端界面
 
@@ -190,7 +190,7 @@ const [data, setData] = useState<any[]>([])
 | 类型别名 | PascalCase | `ReceiptStatus` |
 | 枚举值 | PascalCase | `'Pending'`、`'Synced'` |
 | 常量 | UPPER_SNAKE | `VALID_CATEGORIES` |
-| 文件 | camelCase | `geminiService.ts` |
+| 文件 | camelCase | `receiptApi.ts` |
 
 ### 4.3 React 组件规范
 

@@ -3,9 +3,16 @@ Return strict JSON only. Do not include markdown.
 Use null when a field is not visible.
 Use numbers for amounts and quantities.
 Allowed category values: Grocery, Fuel, F&B, Retail, Service, Other.
-Allowed doc_type values: Receipt, Invoice, Credit Note, Expense.
+Allowed doc_type values: Receipt, Invoice, Credit Note, Expense, E-invoice.
 Allowed tags: Business, Personal, Tax Deductible, Pending.
+For Malaysian e-invoices, set doc_type to E-invoice and put e-invoice-only fields in extra_fields.
 `
+
+export type ReceiptPromptOptions = {
+  enabledFields?: string[] | null
+  qrPayload?: string | null
+  schemaProfile?: 'standard' | 'einvoice'
+}
 
 const SUBSIDY_SCHEMA = `{
     "program": string | null,
@@ -21,8 +28,26 @@ const SUBSIDY_SCHEMA = `{
     "notes": string | null
   } | null`
 
-export function buildUserPrompt(ocrText: string) {
+const EINVOICE_EXTRA_FIELDS_SCHEMA = `{
+    "supplier_name": string | null,
+    "buyer_name": string | null,
+    "supplier_tin": string | null,
+    "buyer_tin": string | null,
+    "sst_no": string | null,
+    "invoice_uuid": string | null,
+    "validation_link": string | null,
+    "qr_payload": string | null,
+    "invoice_type": string | null,
+    "tax_amount": number | null
+  } | null`
+
+const STANDARD_EXTRA_FIELDS_SCHEMA = `Record<string, unknown> | null`
+
+export function buildUserPrompt(ocrText: string, options: ReceiptPromptOptions = {}) {
   return `Extract this receipt into the JSON shape below.
+${buildProfileInstruction(options)}
+${buildEnabledFieldsInstruction(options)}
+${buildQrPayloadInstruction(options)}
 
 Special rules for Malaysian fuel subsidy receipts:
 - If the receipt shows Shell, BUDI MADANI RON95, subsidy price, government subsidy, or OPT, set category to Fuel.
@@ -31,6 +56,10 @@ Special rules for Malaysian fuel subsidy receipts:
 - Put the government subsidy amount only in subsidy_details.government_subsidy, not in discount, unless the receipt explicitly labels it as a normal discount.
 - Preserve litre quantities with 3 decimals when visible, for example 32.320 L.
 - For fuel item rows, use unit "L", qty as litres, unit_price as RM/L, and line_total as the fuel gross amount.
+
+Special rules for Malaysian e-invoices:
+- If the image is a Malaysian e-invoice, set doc_type to E-invoice.
+- Put supplier/buyer names, TIN values, SST number, invoice UUID, validation link, QR payload, invoice type, and tax amount in extra_fields.
 
 {
   "merchant_name": string | null,
@@ -41,7 +70,8 @@ Special rules for Malaysian fuel subsidy receipts:
   "date": "YYYY-MM-DD" | null,
   "time": string | null,
   "category": "Grocery" | "Fuel" | "F&B" | "Retail" | "Service" | "Other",
-  "doc_type": "Receipt" | "Invoice" | "Credit Note" | "Expense",
+  "doc_type": "Receipt" | "Invoice" | "Credit Note" | "Expense" | "E-invoice",
+  "custom_doc_type": string | null,
   "subtotal": number,
   "discount": number,
   "tax": number,
@@ -51,6 +81,7 @@ Special rules for Malaysian fuel subsidy receipts:
   "payment_method": string | null,
   "change": number,
   "subsidy_details": ${SUBSIDY_SCHEMA},
+  "extra_fields": ${buildExtraFieldsSchema(options)},
   "tags": string[],
   "confidence_score": number,
   "items": [
@@ -68,12 +99,15 @@ OCR text:
 ${ocrText}`
 }
 
-export function buildImageUserPrompt() {
+export function buildImageUserPrompt(options: ReceiptPromptOptions = {}) {
   return `Read the attached Malaysian receipt or invoice image and extract it into the JSON shape below.
 Focus on the receipt itself, not the table/background.
 Extract every visible line item, even when the OCR-like text is faint or split across multiple rows.
 For receipts with a printed total, make grand_total match the printed NET TOTAL / GRAND TOTAL / TOTAL amount.
 If item totals do not add up, still return the visible printed items and totals; do not invent missing lines.
+${buildProfileInstruction(options)}
+${buildEnabledFieldsInstruction(options)}
+${buildQrPayloadInstruction(options)}
 
 Special rules for Malaysian fuel subsidy receipts:
 - If the receipt shows Shell, BUDI MADANI RON95, subsidy price, government subsidy, or OPT, set category to Fuel.
@@ -84,6 +118,10 @@ Special rules for Malaysian fuel subsidy receipts:
 - For fuel item rows, use unit "L", qty as litres, unit_price as RM/L, and line_total as the fuel gross amount.
 - Capture BUDI MADANI fields in subsidy_details: program, ref_no, pump_price, subsidy_price, subsidised_litre, government_subsidy, previous_balance_litre, remaining_balance_litre, gross_total, payable_total.
 
+Special rules for Malaysian e-invoices:
+- If the image is a Malaysian e-invoice, set doc_type to E-invoice.
+- Put supplier/buyer names, TIN values, SST number, invoice UUID, validation link, QR payload, invoice type, and tax amount in extra_fields.
+
 {
   "merchant_name": string | null,
   "company_reg_no": string | null,
@@ -93,7 +131,8 @@ Special rules for Malaysian fuel subsidy receipts:
   "date": "YYYY-MM-DD" | null,
   "time": string | null,
   "category": "Grocery" | "Fuel" | "F&B" | "Retail" | "Service" | "Other",
-  "doc_type": "Receipt" | "Invoice" | "Credit Note" | "Expense",
+  "doc_type": "Receipt" | "Invoice" | "Credit Note" | "Expense" | "E-invoice",
+  "custom_doc_type": string | null,
   "subtotal": number,
   "discount": number,
   "tax": number,
@@ -103,6 +142,7 @@ Special rules for Malaysian fuel subsidy receipts:
   "payment_method": string | null,
   "change": number,
   "subsidy_details": ${SUBSIDY_SCHEMA},
+  "extra_fields": ${buildExtraFieldsSchema(options)},
   "tags": string[],
   "confidence_score": number,
   "items": [
@@ -117,8 +157,11 @@ Special rules for Malaysian fuel subsidy receipts:
 }`
 }
 
-export function buildTextRepairPrompt(ocrText: string, initialJson: Record<string, unknown>) {
+export function buildTextRepairPrompt(ocrText: string, initialJson: Record<string, unknown>, options: ReceiptPromptOptions = {}) {
   return `Repair the structured receipt JSON using the OCR text below.
+${buildProfileInstruction(options)}
+${buildEnabledFieldsInstruction(options)}
+${buildQrPayloadInstruction(options)}
 
 Rules:
 - Return strict JSON only, using the same shape as the initial JSON.
@@ -141,8 +184,11 @@ OCR text:
 ${ocrText}`
 }
 
-export function buildVisionPolishPrompt(visionJson: Record<string, unknown>) {
+export function buildVisionPolishPrompt(visionJson: Record<string, unknown>, options: ReceiptPromptOptions = {}) {
   return `Review and polish the structured receipt JSON below.
+${buildProfileInstruction(options)}
+${buildEnabledFieldsInstruction(options)}
+${buildQrPayloadInstruction(options)}
 
 Rules:
 - Return strict JSON only, using the same shape as the input JSON.
@@ -155,4 +201,41 @@ Rules:
 
 Vision JSON:
 ${JSON.stringify(visionJson, null, 2)}`
+}
+
+function buildProfileInstruction(options: ReceiptPromptOptions) {
+  if (options.schemaProfile !== 'einvoice') return ''
+  return `
+Schema profile: Malaysian E-invoice.
+- Prefer doc_type "E-invoice" unless the image is clearly not an e-invoice.
+- Prioritize supplier_name, buyer_name, supplier_tin, buyer_tin, sst_no, invoice_uuid, validation_link, qr_payload, invoice_type, and tax_amount in extra_fields.
+- Keep ordinary receipt fields in the top-level receipt object and e-invoice-only fields inside extra_fields.
+`
+}
+
+function buildExtraFieldsSchema(options: ReceiptPromptOptions) {
+  return options.schemaProfile === 'einvoice' ? EINVOICE_EXTRA_FIELDS_SCHEMA : STANDARD_EXTRA_FIELDS_SCHEMA
+}
+
+function buildEnabledFieldsInstruction(options: ReceiptPromptOptions) {
+  const fields = options.enabledFields?.filter(Boolean)
+  if (!fields || fields.length === 0) return ''
+  return `
+Enabled field list: ${fields.join(', ')}.
+- Focus extraction on enabled fields.
+- Still return the full JSON shape for compatibility, but use null or empty arrays for disabled optional fields when they are not needed for totals, validation, doc_type, or warnings.
+- Always keep subtotal, grand_total, and enough item data to validate arithmetic when visible.
+`
+}
+
+function buildQrPayloadInstruction(options: ReceiptPromptOptions) {
+  const payload = options.qrPayload?.trim()
+  if (!payload) return ''
+  return `
+Detected QR payload from the uploaded image:
+${payload}
+- Preserve this exact value in extra_fields.qr_payload when the receipt is an E-invoice.
+- Use this payload to infer validation_link or invoice_uuid only when they are explicit in the payload.
+- Do not mark the receipt as E-invoice from QR presence alone unless the QR payload or image content clearly indicates an e-invoice.
+`
 }

@@ -1,7 +1,7 @@
 import type { ReceiptCategory, ReceiptDocType, ReceiptTag } from '../types/receipt'
 
 const validCategories: ReceiptCategory[] = ['Grocery', 'Fuel', 'F&B', 'Retail', 'Service', 'Other']
-const validDocTypes: ReceiptDocType[] = ['Receipt', 'Invoice', 'Credit Note', 'Expense']
+const validDocTypes: ReceiptDocType[] = ['Receipt', 'Invoice', 'Credit Note', 'Expense', 'E-invoice']
 const validTags: ReceiptTag[] = ['Business', 'Personal', 'Tax Deductible', 'Pending']
 
 export function normalizeMoney(value: unknown): number {
@@ -24,6 +24,7 @@ export function normalizeReceiptPatch(input: Record<string, unknown>) {
     ...input,
     category,
     doc_type,
+    custom_doc_type: typeof input.custom_doc_type === 'string' && input.custom_doc_type.trim() ? input.custom_doc_type.trim() : null,
     tags,
     subtotal: normalizeMoney(input.subtotal),
     discount: normalizeMoney(input.discount),

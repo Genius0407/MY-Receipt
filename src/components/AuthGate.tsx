@@ -53,11 +53,6 @@ export function AuthGate({ children }: AuthGateProps) {
     setMessage(error ? error.message : null)
   }
 
-  async function signOut() {
-    if (!supabase) return
-    await supabase.auth.signOut()
-  }
-
   if (!isSupabaseConfigured) {
     return (
       <div className="min-h-screen bg-slate-100 px-6 py-10 text-slate-900">
@@ -84,7 +79,7 @@ export function AuthGate({ children }: AuthGateProps) {
     return (
       <div className="grid min-h-screen place-items-center bg-slate-100 px-6 text-slate-900">
         <div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-8 shadow-sm">
-          <h1 className="text-xl font-black">MY-Receipt</h1>
+          <h1 className="text-xl font-black">ResitAI</h1>
           <p className="mt-2 text-sm text-slate-500">匿名试用可直接进入；邮箱登录用于保留长期账号。</p>
           <div className="mt-6 space-y-3">
             <button
@@ -124,15 +119,6 @@ export function AuthGate({ children }: AuthGateProps) {
 
   return (
     <>
-      <div className="fixed right-6 top-3 z-30">
-        <button
-          type="button"
-          onClick={signOut}
-          className="rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-black text-slate-500 shadow-sm hover:bg-slate-50"
-        >
-          退出登录
-        </button>
-      </div>
       {children}
     </>
   )

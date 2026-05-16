@@ -1,6 +1,6 @@
-# MY-Receipt
+# ResitAI
 
-马来西亚英文收据智能识别与管理系统。
+马来西亚英文收据智能识别、会计审校与异常管理系统。
 
 当前仓库是 React/Vite 静态前端 + Supabase 后端资源的生产化工程。
 
@@ -12,7 +12,7 @@
 静态前端 + Supabase Auth/Storage/Postgres + Supabase Edge Function + 腾讯云 OCR + 手动审核
 ```
 
-前端仍是纯静态应用，不需要自建服务器。上传图片会先进入裁剪/旋转预处理，原图和识别用裁剪图都会保留在 Supabase Storage。默认可接腾讯云 OCR 免费资源包，并在数据库中硬限制每用户每月最多 900 次 OCR 调用；超额或未配置 OCR 时自动创建待审核草稿。腾讯 OCR 后可选接 DeepSeek V4 做低成本文本修复；审核页还提供 Qwen VL 视觉重解析按钮，只有人工点击时才调用视觉大模型，并可再接 DeepSeek 做结构和金额校验。
+前端仍是纯静态应用，不需要自建服务器。上传图片会先快速保存原图并创建待解析记录；用户进入审核页点击“智能解析”时再裁剪/旋转，原图和识别用裁剪图都会保留在 Supabase Storage。默认可接腾讯云 OCR 免费资源包，并在数据库中硬限制每用户每月最多 900 次 OCR 调用；超额或未配置 OCR 时自动创建待审核草稿。审核页的智能解析使用 Qwen VL 读取图片，并由 DeepSeek 做结构和金额校验；腾讯 OCR 后也可选接 DeepSeek V4 做低成本文本修复。
 
 ## 本地运行
 
@@ -38,7 +38,7 @@ npm run build
 ## 目录说明
 
 ```text
-MY-Receipt/
+ResitAI/
 ├── src/                              # 当前 React/Vite 前端原型
 ├── public/
 ├── docs/
@@ -88,9 +88,12 @@ Supabase 需要：
 
 - `receipts` 表：收据主记录。
 - `receipt_items` 表：商品明细。
+- `custom_document_types` 表：用户自定义单据类型。
+- `user_field_preferences` 表：字段显示与导出配置。
 - 私有 Storage bucket：`receipts`。
 - RLS policy：用户只能访问自己的数据。
-- 上传图片路径：`original.ext` 保存原图，`processed.jpg` 保存裁剪后的识别图。
+- 上传图片路径：`original.ext` 保存原图，`processed-{timestamp}.ext` 保存每次智能解析前裁剪后的识别图。
+- v0.3 字段：`processing_stage`、`warnings`、`deleted_at`、`deleted_reason`、`duplicate_of`、`file_hash`、`custom_doc_type`、`extra_fields`。
 
 SQL 参考：[docs/SUPABASE_SCHEMA.sql](docs/SUPABASE_SCHEMA.sql)。
 
@@ -109,6 +112,7 @@ SQL 参考：[docs/SUPABASE_SCHEMA.sql](docs/SUPABASE_SCHEMA.sql)。
 5. 实现 `parse-receipt` Edge Function。
 6. 前端接入 Supabase 列表、详情编辑、标签、筛选。
 7. 用 ExcelJS 实现按筛选结果导出 Excel。
+8. v0.3 审核效率：processing panel、warning panel、soft delete/rejected receipts、duplicate detection、字段配置、自定义单据类型、E-invoice。
 
 ## 已废弃方向
 

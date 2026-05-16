@@ -1,0 +1,135 @@
+import { Banknote, CheckCircle, Languages, Moon, Settings, Sun, X } from 'lucide-react'
+import { FieldConfigPanel } from './FieldConfigPanel'
+import type { FieldPreference } from '../types/fieldConfig'
+
+interface SettingsModalProps {
+  config: any
+  labels: any
+  themes: any[]
+  fieldPreferences: FieldPreference[]
+  onConfigChange: (config: any) => void
+  onFieldPreferencesChange: (preferences: FieldPreference[]) => void
+  onClose: () => void
+}
+
+export function SettingsModal({
+  config,
+  labels,
+  themes,
+  fieldPreferences,
+  onConfigChange,
+  onFieldPreferencesChange,
+  onClose,
+}: SettingsModalProps) {
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-slate-900/60 backdrop-blur-sm animate-in fade-in">
+      <div className={`w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-[32px] shadow-2xl p-8 space-y-6 transition-colors ${config.colorMode === 'Dark' ? 'bg-slate-900 text-white border border-slate-800' : 'bg-white text-slate-900'}`}>
+        <div className={`flex justify-between items-center border-b pb-4 ${config.colorMode === 'Dark' ? 'border-slate-800' : 'border-slate-50'}`}>
+          <h3 className="text-xl font-black flex items-center gap-2">
+            <Settings className="w-5 h-5" /> {labels.systemPref}
+          </h3>
+          <button onClick={onClose} className={`p-2 rounded-full transition-all ${config.colorMode === 'Dark' ? 'hover:bg-slate-800 text-slate-400' : 'hover:bg-slate-100 text-slate-400'}`}>
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="space-y-6">
+          <div className="space-y-3">
+            <label className={`text-[10px] font-black uppercase tracking-[2px] flex items-center gap-2 ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>
+              <Languages className="w-3.5 h-3.5" /> {labels.languagePref}
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              {[{ id: 'zh', name: '中文' }, { id: 'en', name: 'English' }, { id: 'ms', name: 'Melayu' }].map((lang) => (
+                <button
+                  key={lang.id}
+                  onClick={() => onConfigChange({ ...config, language: lang.id })}
+                  className={`px-4 py-3 rounded-xl text-xs font-black transition-all border ${
+                    config.language === lang.id
+                      ? `${config.theme.color} text-white border-transparent shadow-lg`
+                      : config.colorMode === 'Dark'
+                        ? 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+                        : 'bg-slate-50 border-slate-100 text-slate-600 hover:bg-white hover:shadow-sm'
+                  }`}
+                >
+                  {lang.name}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <label className={`text-[10px] font-black uppercase tracking-[2px] flex items-center gap-2 ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>
+              <Sun className="w-3.5 h-3.5" /> {labels.themeMode}
+            </label>
+            <div className="flex p-1 bg-slate-100 dark:bg-slate-800 rounded-2xl gap-1">
+              <button
+                onClick={() => onConfigChange({ ...config, colorMode: 'Light' })}
+                className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-black transition-all ${config.colorMode === 'Light' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-500 hover:text-slate-700'}`}
+              >
+                <Sun className="w-4 h-4" /> {labels.lightMode}
+              </button>
+              <button
+                onClick={() => onConfigChange({ ...config, colorMode: 'Dark' })}
+                className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-black transition-all ${config.colorMode === 'Dark' ? 'bg-slate-700 shadow-sm text-white' : 'text-slate-500 hover:text-slate-300'}`}
+              >
+                <Moon className="w-4 h-4" /> {labels.darkMode}
+              </button>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <label className={`text-[10px] font-black uppercase tracking-[2px] flex items-center gap-2 ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>
+              <Banknote className="w-3.5 h-3.5" /> {labels.currencyPref}
+            </label>
+            <div className="grid grid-cols-3 gap-2">
+              {['RM', 'USD', 'CNY'].map((currency) => (
+                <button
+                  key={currency}
+                  onClick={() => onConfigChange({ ...config, currency })}
+                  className={`px-4 py-3 rounded-xl text-xs font-black transition-all border ${
+                    config.currency === currency
+                      ? `${config.theme.color} text-white border-transparent shadow-lg`
+                      : config.colorMode === 'Dark'
+                        ? 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+                        : 'bg-slate-50 border-slate-100 text-slate-600 hover:bg-white hover:shadow-sm'
+                  }`}
+                >
+                  {currency}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <label className={`text-[10px] font-black uppercase tracking-[2px] block mb-3 ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>{labels.brandColor}</label>
+            <div className="flex gap-4">
+              {themes.map((theme) => (
+                <button
+                  key={theme.name}
+                  onClick={() => onConfigChange({ ...config, theme })}
+                  className={`w-10 h-10 rounded-2xl ${theme.color} flex items-center justify-center transition-all ${config.theme.name === theme.name ? 'scale-110 ring-4 ring-offset-4 ' + (config.colorMode === 'Dark' ? 'ring-slate-700 ring-offset-slate-900' : 'ring-slate-200 ring-offset-white') : 'opacity-40 hover:opacity-100'}`}
+                >
+                  {config.theme.name === theme.name && <CheckCircle className="w-5 h-5 text-white" />}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <label className={`text-[10px] font-black uppercase tracking-[2px] block ${config.colorMode === 'Dark' ? 'text-slate-500' : 'text-slate-400'}`}>Field extraction & export</label>
+            <FieldConfigPanel preferences={fieldPreferences} onChange={onFieldPreferencesChange} />
+          </div>
+        </div>
+
+        <div className="pt-2">
+          <button
+            onClick={onClose}
+            className={`w-full py-4 ${config.theme.color} text-white rounded-2xl font-black uppercase tracking-widest text-xs shadow-lg hover:brightness-110 transition-all`}
+          >
+            {labels.saveAndApply}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}

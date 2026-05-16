@@ -57,6 +57,11 @@
     "time": "15:27",
     "category": "Fuel",
     "doc_type": "Receipt",
+    "processing_stage": "ready_for_review",
+    "warnings": [],
+    "duplicate_of": null,
+    "duplicate_score": null,
+    "extra_fields": null,
     "subtotal": 138.01,
     "grand_total": 138.01,
     "payment_method": "Card",
@@ -107,7 +112,7 @@
 ```ts
 // 使用 Supabase JS SDK（推荐）
 const { data, error } = await supabase.functions.invoke('parse-receipt', {
-  body: { receipt_id: 'abc-123', mode: 'vision' },
+  body: { receipt_id: 'abc-123', mode: 'smart' },
 })
 
 // 或使用 fetch
@@ -137,7 +142,33 @@ const { data, error } = await fetch(
 | `supabase.from('receipts').select('*, receipt_items(*)')` | 查询列表（含明细） |
 | `supabase.from('receipts').insert({...})` | 创建记录 |
 | `supabase.from('receipts').update({...}).eq('id', id)` | 更新记录 |
-| `supabase.from('receipts').delete().eq('id', id)` | 删除记录 |
+| `supabase.from('receipts').update({ deleted_at, deleted_reason }).eq('id', id)` | 默认软删除，进入 rejected receipts |
+| `supabase.from('receipts').delete().eq('id', id)` | 仅永久删除时使用 |
+
+v0.3 新增字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `processing_stage` | `uploaded` / `ocr_scanning` / `ai_extracting` / `generating_preview` / `ready_for_review` / `ocr_failed` |
+| `warnings` | `{ code, severity, message, field?, details? }[]` |
+| `deleted_at`, `deleted_reason`, `deleted_note` | Rejected receipts / 删除库 |
+| `file_hash`, `duplicate_of`, `duplicate_score` | 文件 hash 与业务去重 |
+| `custom_doc_type` | 用户自定义单据类型 |
+| `extra_fields` | E-invoice 专属字段 |
+
+### custom_document_types
+
+| 方法 | 描述 |
+|------|------|
+| `supabase.from('custom_document_types').select('*')` | 查询当前用户自定义类型 |
+| `supabase.from('custom_document_types').upsert({...}, { onConflict: 'user_id,name' })` | 保存自定义类型 |
+
+### user_field_preferences
+
+| 方法 | 描述 |
+|------|------|
+| `supabase.from('user_field_preferences').select('*')` | 查询字段显示/导出配置 |
+| `supabase.from('user_field_preferences').upsert([...], { onConflict: 'user_id,field_key' })` | 保存字段配置 |
 
 ### receipt_items
 
@@ -182,13 +213,15 @@ const { error } = await supabase.storage
   .upload(filePath, file)
 ```
 
-### 获取公共 URL
+### 获取签名 URL
 
 ```ts
-const { data: { publicUrl } } = supabase.storage
+const { data: { signedUrl } } = await supabase.storage
   .from('receipts')
-  .getPublicUrl(filePath)
+  .createSignedUrl(filePath, 60 * 60)
 ```
+
+`receipts` bucket 是 private bucket，不使用 `getPublicUrl`。
 
 ---
 
@@ -214,9 +247,8 @@ const { data: { publicUrl } } = supabase.storage
 |----------|---------|------|
 | `VITE_SUPABASE_URL` | 前端 | Supabase 项目 URL |
 | `VITE_SUPABASE_ANON_KEY` | 前端 | 匿名 Key (可公开) |
-| `GEMINI_API_KEY` | 不使用 | 生产路径已移除前端 Gemini 调用 |
-| `OPENAI_API_KEY` | Edge Function | OpenAI API Key |
-| `GOOGLE_VISION_KEY` | Edge Function | Google Vision API Key |
+| `OCR_PROVIDER` | Edge Function | 默认 OCR Provider，当前生产推荐 `tencent` |
+| `OPENAI_API_KEY` | Edge Function | 可选 OpenAI Vision Key，默认不启用 |
 | `SUPABASE_SERVICE_ROLE_KEY` | Edge Function | Supabase 服务角色密钥 |
 | `TENCENT_SECRET_ID` | Edge Function | 腾讯云 SecretId |
 | `TENCENT_SECRET_KEY` | Edge Function | 腾讯云 SecretKey |
